@@ -1,0 +1,61 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+.pytest_cache
+.mypy_cache
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE
+.vscode/
+.cursor/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+docs/
+LICENSE
+# Keep README.md for Poetry (exclude other md files)
+docs/*.md
+
+# Development files
+.env
+.env.local
+
+# Logs
+logs/
+*.log
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Poetry (cache only, keep lock file)
+.poetry/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Keep scripts directory
+!scripts/ 
