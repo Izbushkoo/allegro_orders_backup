@@ -24,6 +24,10 @@ fastapi-users = "^12.1.2"
 fastapi-pagination = "^0.12.12"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 pydantic-settings = "^2.10.1"
+pytz = "^2025.2"
+sqlalchemy-celery-beat = "^0.8.4"
+requests = "^2.32.4"
+flower = "^2.0.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"

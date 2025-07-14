@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: ${DATABASE_USER:-allegro_user}
       POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-allegro_password}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - $HOME/projects/allegro_orders_backup/postgres_data:/var/lib/postgresql/data
     ports:
       - "${DATABASE_PORT:-5432}:5432"
     healthcheck:
@@ -66,7 +66,7 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     restart: unless-stopped
 
-  # Celery Worker
+  # Celery Worker (универсальный, обслуживает все очереди)
   celery_worker:
     build:
       context: .
@@ -102,7 +102,7 @@ services:
       dockerfile: Dockerfile
     container_name: allegro_celery_beat
     environment:
-      - DATABASE_URL=postgresql://${DATABASE_USER:-allegro_user}:${DATABASE_PASSWORD:-allegro_password}@postgres:5432/${DATABASE_NAME:-allegro_orders}
+      - DATABASE_URL=postgresql://${DATABASE_USER:-allegro_user}:${DATABASE_PASSWORD:-allegro_password}@postgres:5432/${DATABASE_NAME:-allegro_orders}?options=-csearch_path=celery_schema,public
       - DATABASE_HOST=postgres
       - REDIS_URL=redis://redis:6379/0
       - REDIS_HOST=redis
@@ -121,7 +121,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info"]
+    command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info", "-S", "sqlalchemy_celery_beat.schedulers:DatabaseScheduler", "-l", "info"]
     restart: unless-stopped
 
   # Flower - Celery monitoring (optional)

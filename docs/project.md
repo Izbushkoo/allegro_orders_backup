@@ -118,6 +118,36 @@ CREATE INDEX idx_order_events_occurred ON order_events(occurred_at);
 CREATE INDEX idx_sync_history_token_timestamp ON sync_history(token_id, sync_timestamp);
 ```
 
+## Архитектура Celery очередей по токену
+
+- Для каждого токена создаётся отдельная очередь Celery (sync_{token_id})
+- Задачи синхронизации для каждого токена отправляются в свою очередь
+- Воркеры Celery масштабируются горизонтально и могут обслуживать одну или несколько очередей
+- Все статусы и результаты задач хранятся в таблице task_history (Postgres)
+- API позволяет запускать, останавливать и получать статус задач по токену и task_id
+
+### Схема взаимодействия
+
+```mermaid
+flowchart TD
+    User -- API: start sync --> FastAPI
+    FastAPI -- .apply_async(queue=sync_{token_id}) --> Celery
+    Celery -- task_id, status --> Postgres[(task_history)]
+    FastAPI -- API: status/stop/list --> Postgres
+    FastAPI -- revoke(task_id) --> Celery
+    Celery -- обновляет статус --> Postgres
+    Celery -. масштабируется .-> Celery
+```
+
+### Масштабирование
+- В docker-compose можно запускать несколько воркеров, каждый обслуживает одну или несколько очередей
+- Для высокой нагрузки рекомендуется использовать autoscaling (например, в Kubernetes)
+- Очереди создаются динамически по мере появления новых токенов
+
+### Best practices
+- Для большого количества токенов очереди можно группировать (например, по пользователю или по хешу токена)
+- Для мониторинга использовать таблицу task_history и Celery Flower
+
 ## Allegro API Integration
 
 ### Device Code Flow авторизации
@@ -421,6 +451,16 @@ LOG_BACKUP_COUNT=3
 - Статистика синхронизации
 - Производительность API
 - Ошибки и исключения
+
+## Автосинхронизация заказов (periodic tasks)
+
+- Для каждого токена можно включить автосинхронизацию через API (POST /sync/activate)
+- Для автосинхронизации используется celery-sqlalchemy-scheduler (расписание хранится в Postgres)
+- Отключение автосинхронизации — через API (POST /sync/deactivate)
+- Список активных автосинхронизаций доступен через API (GET /sync/active)
+- Все активные автосинхронизации хранятся в таблице active_sync_schedules (user_id, token_id, interval, статус, last_run, last_success, ...)
+- Для работы с celery-sqlalchemy-scheduler используется функция get_alchemy_session
+- Best practices: всегда закрывать сессии, использовать уникальные task_name для каждого токена, хранить мониторинг в БД
 
 ## Развертывание
 

@@ -58,6 +58,9 @@ init-db:
 	@echo "Применение начальной миграции..."
 	docker compose exec app python scripts/create_migration.py upgrade
 
+init-celery-beat:
+	docker compose exec app python scripts/init_celery_beat_tables.py
+
 # Полная очистка
 clean:
 	docker compose down -v

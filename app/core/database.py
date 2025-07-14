@@ -5,12 +5,13 @@
 """
 
 import asyncio
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Generator
 from sqlmodel import SQLModel, create_engine, Session
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
+from sqlalchemy.orm import Session as AlchemySession
 
 from .settings import settings
 from .logging import get_logger
@@ -51,7 +52,7 @@ def create_tables() -> None:
     logger.info("Database tables created successfully")
 
 
-def get_sync_session() -> Session:
+def get_sync_session() -> Generator[Session, None, None]:
     """Получить синхронную сессию базы данных для Celery и миграций"""
     with Session(sync_engine) as session:
         try:
@@ -130,4 +131,25 @@ class DatabaseManager:
 
 
 # Глобальный экземпляр менеджера базы данных
-db_manager = DatabaseManager() 
+db_manager = DatabaseManager()
+
+
+def get_sync_db_session_direct() -> Session:
+    """
+    Получить синхронную сессию напрямую без генератора.
+    Используется в сервисах и Celery задачах.
+    
+    ВАЖНО: Не забывайте закрывать сессию!
+    
+    Returns:
+        Session: Синхронная сессия базы данных
+    """
+    return Session(sync_engine) 
+
+
+def get_alchemy_session() -> AlchemySession:
+    """
+    Получить обычную SQLAlchemy ORM сессию (AlchemySession) для работы с celery-sqlalchemy-scheduler и другими низкоуровневыми задачами.
+    ВАЖНО: Не забывайте закрывать сессию!
+    """
+    return AlchemySession(sync_engine) 

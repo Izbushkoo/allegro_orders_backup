@@ -19,6 +19,8 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from app.core.settings import settings
 from app.models import *  # Импортируем все модели
 from app.models.base import BaseModel
+from app.models.task_history import TaskHistory
+from app.models.active_sync_schedule import ActiveSyncSchedule
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

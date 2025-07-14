@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from sqlmodel import SQLModel, Field
+from sqlmodel import SQLModel, Field, UniqueConstraint
 
 from .base import BaseModel
 
@@ -20,7 +20,7 @@ class UserToken(BaseModel, table=True):
     
     user_id: str = Field(
         index=True,
-        description="Внешний идентификатор пользователя"
+        description="Идентификатор пользователя из JWT токена"
     )
     
     allegro_token: str = Field(
@@ -39,6 +39,10 @@ class UserToken(BaseModel, table=True):
         default=True,
         description="Активен ли токен"
     )
+    
+
+    # Ограничения для контроля дублирования токенов
+    # Не используем unique constraint, так как пользователь может иметь несколько токенов для одного аккаунта
 
 
 class UserTokenCreate(SQLModel):
@@ -68,4 +72,4 @@ class UserTokenUpdate(SQLModel):
     refresh_token: Optional[str] = None
     expires_at: Optional[datetime] = None
     is_active: Optional[bool] = None
-    updated_at: Optional[datetime] = Field(default_factory=datetime.utcnow) 
+    

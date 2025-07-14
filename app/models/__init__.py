@@ -22,7 +22,7 @@ from .order_event import (
     OrderEvent, 
     OrderEventCreate, 
     OrderEventRead, 
-    OrderEventSummary
+    OrderEventUpdate
 )
 from .sync_history import (
     SyncHistory, 
@@ -47,7 +47,7 @@ __all__ = [
     "OrderEvent",
     "OrderEventCreate",
     "OrderEventRead",
-    "OrderEventSummary",
+    "OrderEventUpdate",
     "SyncHistory",
     "SyncHistoryCreate",
     "SyncHistoryRead",

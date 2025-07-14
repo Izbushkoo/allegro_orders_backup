@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 from uuid import UUID
 
-from sqlmodel import SQLModel, Field, Relationship, Column, JSON
+from sqlmodel import SQLModel, Field, Relationship, Column, JSON, UniqueConstraint
 
 from .base import BaseModel
 
@@ -23,7 +23,7 @@ class OrderBase(SQLModel):
     
     allegro_order_id: str = Field(
         index=True,
-        description="ID заказа в системе Allegro"
+        description="ID заказа в системе Allegro (уникальный для токена)"
     )
     
     order_data: Dict[str, Any] = Field(
@@ -42,10 +42,16 @@ class OrderBase(SQLModel):
     )
 
 
+
 class Order(OrderBase, BaseModel, table=True):
     """Модель заказа в базе данных"""
     
     __tablename__ = "orders"
+    
+    # Уникальный констрейнт для предотвращения дублирования заказов per-token
+    __table_args__ = (
+        UniqueConstraint("token_id", "allegro_order_id", name="uq_orders_per_token"),
+    )
     
     # Связи с другими таблицами (закомментировано для отладки)
     # user_token: "UserToken" = Relationship(back_populates="orders")

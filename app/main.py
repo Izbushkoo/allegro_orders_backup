@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.settings import settings
 from app.core.logging import setup_logging, get_logger
 from app.core.database import db_manager
+from app.core.auth import CurrentUser
+from app.api.dependencies import CurrentUserDep
 
 
 logger = get_logger(__name__)
@@ -201,6 +203,54 @@ async def get_configuration():
             "details": str(e),
             "timestamp": datetime.now().isoformat()
         }
+
+
+@app.get("/test-jwt", tags=["test"], summary="Тестирование JWT токена")
+async def test_jwt_token(current_user: CurrentUser = CurrentUserDep):
+    """
+    Тестовый эндпоинт для проверки JWT аутентификации.
+    
+    **Требует аутентификации через JWT токен.**
+    
+    Возвращает информацию о текущем пользователе извлеченную из JWT токена.
+    """
+    return {
+        "message": "JWT токен успешно декодирован",
+        "current_user": {
+            "user_id": current_user.user_id,
+            "username": current_user.username,
+            "is_active": current_user.is_active
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.post("/test-jwt/create", tags=["test"], summary="Создание тестового JWT токена")
+async def create_test_jwt_token(user_id: str = "test_user_123", username: str = "test_user"):
+    """
+    Создает тестовый JWT токен для проверки аутентификации.
+    
+    **ТОЛЬКО ДЛЯ ТЕСТИРОВАНИЯ!**
+    
+    - **user_id**: ID пользователя для токена
+    - **username**: Имя пользователя для токена
+    """
+    from app.core.auth import create_access_token
+    
+    token_data = {
+        "user_id": user_id,
+        "username": username
+    }
+    
+    access_token = create_access_token(data=token_data)
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user_id": user_id,
+        "username": username,
+        "instructions": "Используйте этот токен в заголовке: Authorization: Bearer <access_token>"
+    }
 
 
 # Подключение роутеров

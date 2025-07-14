@@ -32,6 +32,7 @@ def log_environment_variables() -> Dict[str, str]:
         'REDIS_URL', 'REDIS_HOST', 'REDIS_PORT', 'REDIS_DB',
         'API_HOST', 'API_PORT', 'DEBUG', 'API_PREFIX', 'SECRET_KEY',
         'API_KEY_HEADER', 'TOKEN_EXPIRE_HOURS',
+        'JWT_SECRET_KEY', 'JWT_ALGORITHM', 'JWT_ACCESS_TOKEN_EXPIRE_MINUTES',
         'CELERY_BROKER_URL', 'CELERY_RESULT_BACKEND', 'CELERY_TASK_SERIALIZER',
         'CELERY_RESULT_SERIALIZER', 'CELERY_TIMEZONE',
         'ALLEGRO_CLIENT_ID', 'ALLEGRO_CLIENT_SECRET', 'ALLEGRO_API_URL',
@@ -69,6 +70,8 @@ class DatabaseSettings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
+        extra = "ignore"
 
 
 class RedisSettings(BaseSettings):
@@ -82,6 +85,8 @@ class RedisSettings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
+        extra = "ignore"
 
 
 class APISettings(BaseSettings):
@@ -94,10 +99,22 @@ class APISettings(BaseSettings):
     secret_key: str = Field(default="dev_secret_key_change_in_production", alias="SECRET_KEY")
     api_key_header: str = Field(default="X-API-Key", alias="API_KEY_HEADER")
     token_expire_hours: int = Field(default=24, alias="TOKEN_EXPIRE_HOURS")
+    
+    # JWT настройки
+    jwt_secret_key: str = Field(
+        default="jwt_secret_key_change_in_production",
+        alias="JWT_SECRET_KEY"
+    )
+    jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
+    jwt_access_token_expire_minutes: int = Field(
+        default=30,
+        alias="JWT_ACCESS_TOKEN_EXPIRE_MINUTES"
+    )
 
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 class CelerySettings(BaseSettings):
@@ -113,6 +130,7 @@ class CelerySettings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 class AllegroSettings(BaseSettings):
@@ -133,6 +151,7 @@ class AllegroSettings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 class LoggingSettings(BaseSettings):
@@ -147,6 +166,7 @@ class LoggingSettings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 class SyncSettings(BaseSettings):
@@ -164,6 +184,7 @@ class SyncSettings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 class Settings(BaseSettings):
@@ -181,6 +202,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
     
     def log_configuration(self) -> Dict[str, Any]:
         """Возвращает конфигурацию для логирования"""
@@ -204,7 +226,9 @@ class Settings(BaseSettings):
                 "port": self.api.port,
                 "debug": self.api.debug,
                 "prefix": self.api.prefix,
-                "secret_key": mask_sensitive_value("secret_key", self.api.secret_key)
+                "secret_key": mask_sensitive_value("secret_key", self.api.secret_key),
+                "jwt_secret_key": mask_sensitive_value("jwt_secret_key", self.api.jwt_secret_key),
+                "jwt_algorithm": self.api.jwt_algorithm
             },
             "celery": {
                 "broker_url": mask_sensitive_value("broker_url", self.celery.broker_url),

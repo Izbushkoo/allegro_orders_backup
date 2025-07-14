@@ -4,6 +4,7 @@
 @dependencies: fastapi, pydantic
 """
 
+from os import sync
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 from datetime import datetime
@@ -11,7 +12,26 @@ from enum import Enum
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
+from sqlmodel.ext.asyncio.session import AsyncSession
+from celery.result import AsyncResult
+from sqlmodel import select
 
+from app.api.dependencies import DatabaseSession, CurrentUserDep
+from app.core.auth import CurrentUser
+from app.services.order_sync_service import OrderSyncService
+from app.core.database import get_sync_db_session_direct
+from app.core.logging import get_logger
+from app.exceptions import ValidationHTTPException
+from app.celery_app import celery_app
+from app.models.task_history import TaskHistory
+from app.services.task_history_service import TaskHistoryService
+from pydantic import BaseModel, Field
+from app.services.active_sync_schedule_service import ActiveSyncScheduleService
+from app.services.periodic_task_service import PeriodicTaskService
+from sqlalchemy.orm import Session as AlchemySession
+from app.core.database import get_alchemy_session
+
+logger = get_logger(__name__)
 router = APIRouter()
 
 # Enums
@@ -27,10 +47,8 @@ class SyncStatus(str, Enum):
 
 class SyncTrigger(BaseModel):
     """Модель для запуска синхронизации"""
-    user_id: Optional[str] = Field(None, description="ID пользователя (если не указан - все пользователи)")
-    token_id: Optional[UUID] = Field(None, description="ID токена (если не указан - все токены пользователя)")
+    token_id: UUID = Field(..., description="ID токена для синхронизации (обязательный параметр)")
     sync_from_date: Optional[datetime] = Field(None, description="Синхронизация с даты")
-    sync_to_date: Optional[datetime] = Field(None, description="Синхронизация по дату")
     force_full_sync: bool = Field(False, description="Принудительная полная синхронизация")
 
 class SyncResponse(BaseModel):
@@ -75,132 +93,463 @@ class SyncTaskResponse(BaseModel):
     message: str
     started_at: datetime
 
-# API эндпоинты
+class TaskHistoryRead(BaseModel):
+    id: UUID
+    task_id: str
+    user_id: UUID
+    task_type: str
+    status: str
+    params: Dict[str, Any]
+    result: Optional[Dict[str, Any]]
+    error: Optional[str]
+    started_at: datetime
+    finished_at: Optional[datetime]
+    updated_at: datetime
+    description: Optional[str]
+    progress: Optional[float]
+    parent_task_id: Optional[str]
 
-@router.post("/start", response_model=SyncTaskResponse, summary="Запустить синхронизацию")
-async def start_sync(sync_params: SyncTrigger):
-    """
-    Запустить синхронизацию заказов.
-    
-    - **user_id**: ID пользователя (опционально)
-    - **token_id**: ID токена (опционально)
-    - **sync_from_date**: Синхронизация с даты (опционально)
-    - **sync_to_date**: Синхронизация по дату (опционально)
-    - **force_full_sync**: Принудительная полная синхронизация
-    """
-    # TODO: Реализовать запуск синхронизации
-    raise HTTPException(status_code=501, detail="Не реализовано")
+    class Config:
+        orm_mode = True
 
-@router.post("/start/user/{user_id}", response_model=SyncTaskResponse, summary="Запустить синхронизацию для пользователя")
-async def start_user_sync(
-    user_id: str,
-    sync_from_date: Optional[datetime] = Query(None, description="Синхронизация с даты"),
-    sync_to_date: Optional[datetime] = Query(None, description="Синхронизация по дату"),
-    force_full_sync: bool = Query(False, description="Принудительная полная синхронизация")
+class ActivateSyncRequest(BaseModel):
+    token_id: UUID
+    interval_minutes: int = Field(..., ge=1, le=1440, description="Интервал автосинхронизации в минутах (1-1440)")
+
+class DeactivateSyncRequest(BaseModel):
+    token_id: UUID
+
+# API Endpoints
+
+@router.post("/start", response_model=Dict[str, Any], summary="Запустить синхронизацию")
+async def start_sync(
+    sync_params: SyncTrigger,
+    current_user: CurrentUser = CurrentUserDep
 ):
     """
-    Запустить синхронизацию для конкретного пользователя.
+    Запустить синхронизацию заказов для текущего пользователя через Celery.
     
-    - **user_id**: ID пользователя
-    - **sync_from_date**: Синхронизация с даты
-    - **sync_to_date**: Синхронизация по дату
-    - **force_full_sync**: Принудительная полная синхронизация
+    **Требует аутентификации через JWT токен.**
+    
+    Выполняет асинхронную синхронизацию заказов с Allegro API через Celery.
     """
-    # TODO: Реализовать запуск синхронизации для пользователя
-    raise HTTPException(status_code=501, detail="Не реализовано")
+    try:
+        logger.info(f"Запуск синхронизации (через Celery) для пользователя {current_user.user_id} с токеном {sync_params.token_id}")
+        
+        # Проверяем что токен принадлежит пользователю
+        from app.services.allegro_auth_service import AllegroAuthService
+        auth_service = AllegroAuthService(None)
+        token_record = auth_service.get_token_by_id_sync(str(sync_params.token_id), current_user.user_id)
+        
+        if not token_record:
+            raise ValidationHTTPException(
+                detail=f"Токен {sync_params.token_id} не найден или не принадлежит пользователю"
+            )
+        
+        # Формируем параметры для Celery задачи
+        celery_kwargs = {
+            "user_id": str(current_user.user_id),
+            "token_id": str(sync_params.token_id),
+            "sync_from_date": sync_params.sync_from_date.isoformat() if sync_params.sync_from_date else None,
+            "force_full_sync": sync_params.force_full_sync
+        }
+        
+        # Импортируем задачу Celery
+        from app.tasks.sync_tasks import run_order_sync_task
+        from datetime import datetime
+        task = run_order_sync_task.delay(**celery_kwargs)
 
-@router.post("/start/token/{token_id}", response_model=SyncTaskResponse, summary="Запустить синхронизацию для токена")
-async def start_token_sync(
-    token_id: UUID,
-    sync_from_date: Optional[datetime] = Query(None, description="Синхронизация с даты"),
-    sync_to_date: Optional[datetime] = Query(None, description="Синхронизация по дату"),
-    force_full_sync: bool = Query(False, description="Принудительная полная синхронизация")
-):
-    """
-    Запустить синхронизацию для конкретного токена.
-    
-    - **token_id**: ID токена
-    - **sync_from_date**: Синхронизация с даты
-    - **sync_to_date**: Синхронизация по дату
-    - **force_full_sync**: Принудительная полная синхронизация
-    """
-    # TODO: Реализовать запуск синхронизации для токена
-    raise HTTPException(status_code=501, detail="Не реализовано")
+        started_at = datetime.utcnow()
+        
+        logger.info(f"Celery задача синхронизации отправлена: task_id={task.id}")
+        
+        return {
+            "success": True,
+            "message": "Синхронизация запущена через Celery",
+            "task_id": task.id,
+            "user_id": current_user.user_id,
+            "token_id": str(sync_params.token_id),
+            "sync_type": "full" if sync_params.force_full_sync else "incremental",
+            "started_at": started_at.isoformat(),
+            "status": "PENDING"
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка запуска синхронизации через Celery: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка запуска синхронизации: {str(e)}")
+
 
 @router.get("/history", response_model=SyncList, summary="История синхронизаций")
 async def get_sync_history(
     page: int = Query(1, ge=1, description="Номер страницы"),
     per_page: int = Query(10, ge=1, le=100, description="Элементов на странице"),
-    user_id: Optional[str] = Query(None, description="ID пользователя"),
     token_id: Optional[UUID] = Query(None, description="ID токена"),
     status: Optional[SyncStatus] = Query(None, description="Статус синхронизации"),
     date_from: Optional[datetime] = Query(None, description="Период с"),
-    date_to: Optional[datetime] = Query(None, description="Период по")
+    date_to: Optional[datetime] = Query(None, description="Период по"),
+    current_user: CurrentUser = CurrentUserDep
 ):
     """
-    Получить историю синхронизаций.
+    Получить историю синхронизаций для текущего пользователя.
     
-    - **page**: Номер страницы
-    - **per_page**: Элементов на странице
-    - **user_id**: Фильтр по ID пользователя
-    - **token_id**: Фильтр по ID токена
-    - **status**: Фильтр по статусу
-    - **date_from**: Период с
-    - **date_to**: Период по
+    **Требует аутентификации через JWT токен.**
     """
-    # TODO: Реализовать получение истории синхронизаций
-    raise HTTPException(status_code=501, detail="Не реализовано")
+    try:
+        logger.info(f"Получение истории синхронизации для пользователя {current_user.user_id}")
+        
+        db_session = get_sync_db_session_direct()
+        sync_service = OrderSyncService(db_session)
+        
+        result = sync_service.get_user_sync_history(
+            user_id=current_user.user_id,
+            page=page,
+            per_page=per_page,
+            token_id=token_id,
+            status=status,
+            date_from=date_from,
+            date_to=date_to
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения истории синхронизации: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка получения истории: {str(e)}")
+
 
 @router.get("/status/{sync_id}", response_model=SyncResponse, summary="Статус синхронизации")
-async def get_sync_status(sync_id: UUID):
+async def get_sync_status(
+    sync_id: UUID,
+    current_user: CurrentUser = CurrentUserDep
+):
     """
-    Получить статус синхронизации по ID.
+    Получить статус конкретной синхронизации.
     
-    - **sync_id**: ID синхронизации
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может получить статус только своих синхронизаций.**
     """
-    # TODO: Реализовать получение статуса синхронизации
-    raise HTTPException(status_code=501, detail="Не реализовано")
+    try:
+        logger.info(f"Получение статуса синхронизации {sync_id} для пользователя {current_user.user_id}")
+        
+        db_session = get_sync_db_session_direct()
+        sync_service = OrderSyncService(db_session)
+        
+        sync_status = sync_service.get_sync_status(
+            sync_id=sync_id,
+            user_id=current_user.user_id
+        )
+        
+        if not sync_status:
+            raise HTTPException(status_code=404, detail="Синхронизация не найдена")
+            
+        return sync_status
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка получения статуса синхронизации: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка получения статуса: {str(e)}")
+
 
 @router.post("/cancel/{sync_id}", summary="Отменить синхронизацию")
-async def cancel_sync(sync_id: UUID):
+async def cancel_sync(
+    sync_id: UUID,
+    current_user: CurrentUser = CurrentUserDep
+):
     """
     Отменить выполняющуюся синхронизацию.
     
-    - **sync_id**: ID синхронизации
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может отменить только свои синхронизации.**
     """
-    # TODO: Реализовать отмену синхронизации
-    raise HTTPException(status_code=501, detail="Не реализовано")
+    try:
+        logger.info(f"Отмена синхронизации {sync_id} для пользователя {current_user.user_id}")
+        
+        db_session = get_sync_db_session_direct()
+        sync_service = OrderSyncService(db_session)
+        
+        result = sync_service.cancel_sync(
+            sync_id=sync_id,
+            user_id=current_user.user_id
+        )
+        
+        if not result["success"]:
+            raise HTTPException(status_code=400, detail=result["message"])
+            
+        return {"message": result["message"], "cancelled": True}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка отмены синхронизации: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка отмены синхронизации: {str(e)}")
+
 
 @router.get("/stats", response_model=SyncStats, summary="Статистика синхронизаций")
 async def get_sync_stats(
-    user_id: Optional[str] = Query(None, description="ID пользователя"),
     date_from: Optional[datetime] = Query(None, description="Период с"),
-    date_to: Optional[datetime] = Query(None, description="Период по")
+    date_to: Optional[datetime] = Query(None, description="Период по"),
+    current_user: CurrentUser = CurrentUserDep
 ):
     """
-    Получить статистику синхронизаций.
+    Получить статистику синхронизаций для текущего пользователя.
     
-    - **user_id**: Фильтр по ID пользователя
-    - **date_from**: Период с
-    - **date_to**: Период по
+    **Требует аутентификации через JWT токен.**
     """
-    # TODO: Реализовать получение статистики синхронизаций
-    raise HTTPException(status_code=501, detail="Не реализовано")
+    try:
+        logger.info(f"Получение статистики синхронизации для пользователя {current_user.user_id}")
+        
+        db_session = get_sync_db_session_direct()
+        sync_service = OrderSyncService(db_session)
+        
+        stats = sync_service.get_user_sync_stats(
+            user_id=current_user.user_id,
+            date_from=date_from,
+            date_to=date_to
+        )
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики синхронизации: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка получения статистики: {str(e)}")
+
 
 @router.get("/running", response_model=List[SyncResponse], summary="Активные синхронизации")
-async def get_running_syncs():
+async def get_running_syncs(
+    current_user: CurrentUser = CurrentUserDep
+):
     """
-    Получить список активных синхронизаций.
+    Получить список активных синхронизаций для текущего пользователя.
+    
+    **Требует аутентификации через JWT токен.**
     """
-    # TODO: Реализовать получение активных синхронизаций
-    raise HTTPException(status_code=501, detail="Не реализовано")
+    try:
+        logger.info(f"Получение активных синхронизаций для пользователя {current_user.user_id}")
+        
+        db_session = get_sync_db_session_direct()
+        sync_service = OrderSyncService(db_session)
+        
+        running_syncs = sync_service.get_running_syncs(user_id=current_user.user_id)
+        
+        return running_syncs
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения активных синхронизаций: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка получения активных синхронизаций: {str(e)}")
+
 
 @router.get("/task/{task_id}", response_model=Dict[str, Any], summary="Статус задачи Celery")
-async def get_task_status(task_id: str):
+async def get_task_status(
+    task_id: str,
+    current_user: CurrentUser = CurrentUserDep
+):
     """
-    Получить статус задачи Celery.
+    Получить статус задачи синхронизации Celery.
     
-    - **task_id**: ID задачи Celery
+    **Требует аутентификации через JWT токен.**
     """
-    # TODO: Реализовать получение статуса задачи Celery
-    raise HTTPException(status_code=501, detail="Не реализовано") 
+    try:
+        logger.info(f"Получение статуса задачи {task_id} для пользователя {current_user.user_id}")
+        
+        task_result = AsyncResult(task_id, app=celery_app)
+        
+        return {
+            "task_id": task_id,
+            "status": task_result.status,
+            "result": task_result.result if task_result.successful() else None,
+            "info": task_result.info,
+            "user_id": current_user.user_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения статуса задачи: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка получения статуса задачи: {str(e)}") 
+
+@router.get("/tasks/history", response_model=List[TaskHistoryRead], summary="История всех задач пользователя")
+async def get_task_history(
+    status: Optional[str] = Query(None, description="Статус задачи (PENDING, SUCCESS, FAILURE и т.д.)"),
+    task_type: Optional[str] = Query(None, description="Тип задачи (order_sync, offer_update и т.д.)"),
+    page: int = Query(1, ge=1, description="Номер страницы"),
+    per_page: int = Query(20, ge=1, le=100, description="Элементов на странице"),
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Получить историю всех задач пользователя (любого типа).
+    """
+    try:
+        db_session = get_sync_db_session_direct()
+        statement = select(TaskHistory).where(TaskHistory.user_id == current_user.user_id)
+        if status:
+            statement = statement.where(TaskHistory.status == status)
+        if task_type:
+            statement = statement.where(TaskHistory.task_type == task_type)
+        statement = statement.order_by(TaskHistory.started_at.desc())
+        tasks = db_session.exec(statement.offset((page-1)*per_page).limit(per_page)).all()
+        db_session.close()
+        return tasks
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка получения истории задач: {str(e)}")
+
+@router.get("/tasks/active", response_model=List[TaskHistoryRead], summary="Активные задачи пользователя")
+async def get_active_tasks(
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Получить все активные (не завершённые) задачи пользователя.
+    """
+    try:
+        db_session = get_sync_db_session_direct()
+        statement = select(TaskHistory).where(
+            TaskHistory.user_id == current_user.user_id,
+            TaskHistory.status.in_(["PENDING", "STARTED"])
+        ).order_by(TaskHistory.started_at.desc())
+        tasks = db_session.exec(statement).all()
+        db_session.close()
+        return tasks
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка получения активных задач: {str(e)}")
+
+@router.get("/tasks/{task_id}", response_model=TaskHistoryRead, summary="Детали задачи по task_id")
+async def get_task_details(
+    task_id: str,
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Получить подробную информацию о задаче по её task_id.
+    """
+    try:
+        db_session = get_sync_db_session_direct()
+        statement = select(TaskHistory).where(
+            TaskHistory.task_id == task_id,
+            TaskHistory.user_id == current_user.user_id
+        )
+        task = db_session.exec(statement).first()
+        db_session.close()
+        if not task:
+            raise HTTPException(status_code=404, detail="Задача не найдена")
+        return task
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка получения статуса задачи: {str(e)}") 
+
+@router.post("/tasks/revoke", summary="Отменить задачу по task_id")
+async def revoke_task(
+    task_id: str,
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Отменить Celery задачу по task_id (только если принадлежит пользователю).
+    """
+    db_session = get_sync_db_session_direct()
+    task_service = TaskHistoryService(db_session)
+    task = task_service.get_task_by_id(task_id)
+    if not task or task.user_id != current_user.user_id:
+        db_session.close()
+        raise HTTPException(status_code=404, detail="Задача не найдена или не принадлежит пользователю")
+    # Отправляем revoke в Celery
+    celery_app.control.revoke(task_id, terminate=True)
+    # Обновляем статус в БД
+    task_service.revoke_task(task_id, current_user.user_id)
+    db_session.close()
+    return {"message": "Задача отменена", "task_id": task_id, "status": "REVOKED"}
+
+@router.get("/tasks/{task_id}/result", summary="Подробный результат задачи")
+async def get_task_result(
+    task_id: str,
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Получить подробный результат задачи по task_id (только если принадлежит пользователю).
+    """
+    db_session = get_sync_db_session_direct()
+    task_service = TaskHistoryService(db_session)
+    result = task_service.get_task_result(task_id, current_user.user_id)
+    db_session.close()
+    if not result:
+        raise HTTPException(status_code=404, detail="Задача не найдена или не принадлежит пользователю")
+    return result 
+
+@router.post("/activate", summary="Включить автосинхронизацию для токена")
+async def activate_sync(
+    req: ActivateSyncRequest,
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Включить автосинхронизацию для токена (создать периодическую задачу в Celery Beat).
+    """
+    db = get_sync_db_session_direct()
+    alchemy_db = get_alchemy_session()
+    schedule_service = ActiveSyncScheduleService(db)
+    periodic_service = PeriodicTaskService(alchemy_db)
+    # Проверка: не активирована ли уже
+    if schedule_service.get_by_token(current_user.user_id, str(req.token_id)):
+        db.close()
+        alchemy_db.close()
+        raise HTTPException(status_code=400, detail="Автосинхронизация уже активна для этого токена")
+    task_name = f"sync_{req.token_id}_periodic"
+    # Создать задачу в Beat
+    periodic_service.add_periodic_sync_task(
+        task_name=task_name,
+        user_id=str(current_user.user_id),
+        token_id=str(req.token_id),
+        interval_minutes=req.interval_minutes
+    )
+    # Сохранить в мониторинговой таблице
+    schedule_service.create(
+        user_id=current_user.user_id,
+        token_id=str(req.token_id),
+        interval_minutes=req.interval_minutes,
+        task_name=task_name
+    )
+    db.close()
+    alchemy_db.close()
+    return {"message": "Автосинхронизация активирована", "token_id": str(req.token_id), "interval_minutes": req.interval_minutes}
+
+@router.post("/deactivate", summary="Отключить автосинхронизацию для токена")
+async def deactivate_sync(
+    req: DeactivateSyncRequest,
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Отключить автосинхронизацию для токена (удалить периодическую задачу из Celery Beat).
+    """
+    db = get_sync_db_session_direct()
+    alchemy_db = get_alchemy_session()
+    schedule_service = ActiveSyncScheduleService(db)
+    periodic_service = PeriodicTaskService(alchemy_db)
+    schedule = schedule_service.get_by_token(current_user.user_id, str(req.token_id))
+    if not schedule:
+        db.close()
+        alchemy_db.close()
+        raise HTTPException(status_code=404, detail="Автосинхронизация не найдена для этого токена")
+    # Удалить задачу из Beat
+    periodic_service.remove_periodic_sync_task(schedule.task_name)
+    # Деактивировать в мониторинговой таблице
+    schedule_service.delete(current_user.user_id, str(req.token_id))
+    db.close()
+    alchemy_db.close()
+    return {"message": "Автосинхронизация отключена", "token_id": str(req.token_id)}
+
+@router.get("/active", summary="Список активных автосинхронизаций пользователя")
+async def get_active_syncs(
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Получить список активных автосинхронизаций пользователя.
+    """
+    db = get_sync_db_session_direct()
+    schedule_service = ActiveSyncScheduleService(db)
+    active = schedule_service.get_by_user(current_user.user_id)
+    db.close()
+    return [
+        {
+            "token_id": s.token_id,
+            "interval_minutes": s.interval_minutes,
+            "status": s.status,
+            "last_run_at": s.last_run_at,
+            "last_success_at": s.last_success_at,
+            "created_at": s.created_at,
+            "updated_at": s.updated_at
+        }
+        for s in active
+    ] 

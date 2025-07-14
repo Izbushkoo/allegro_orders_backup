@@ -6,6 +6,7 @@
 
 from celery import Celery
 from celery.schedules import crontab
+import pytz
 
 from app.core.settings import settings
 from app.core.logging import setup_logging, get_logger
@@ -55,38 +56,24 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_send_task_events=True,
     task_send_sent_event=True,
+
+        # — настройки beat на SQLAlchemy —
+    beat_scheduler='sqlalchemy_celery_beat.schedulers:DatabaseScheduler',
+
+    beat_dburi=settings.database.url,  # например 'postgresql+psycopg2://user:pass@localhost/dbname'
+    beat_engine_options={                  # любые опции для SQLAlchemy engine
+        'echo': False,
+        # 'pool_size': 5,
+        # 'max_overflow': 10,
+    },
 )
 
-# Расписание задач
+# Расписание задач (только обновление токенов)
 celery_app.conf.beat_schedule = {
     # Обновление токенов каждые 30 минут
     "refresh-tokens": {
         "task": "app.tasks.token_tasks.refresh_all_tokens",
         "schedule": crontab(minute="*/30"),
-    },
-    
-    # Проверка событий заказов каждые 3 минуты
-    "check-order-events": {
-        "task": "app.tasks.sync_tasks.sync_order_events",
-        "schedule": crontab(minute="*/3"),
-    },
-    
-    # Полная синхронизация заказов каждые 6 часов
-    "full-sync-orders": {
-        "task": "app.tasks.sync_tasks.full_sync_all_orders",
-        "schedule": crontab(minute=0, hour="*/6"),
-    },
-    
-    # Очистка старых записей ежедневно в 2:00
-    "cleanup-old-data": {
-        "task": "app.tasks.cleanup_tasks.cleanup_old_sync_history",
-        "schedule": crontab(hour=2, minute=0),
-    },
-    
-    # Очистка старых событий еженедельно в воскресенье в 3:00
-    "cleanup-old-events": {
-        "task": "app.tasks.cleanup_tasks.cleanup_old_order_events",
-        "schedule": crontab(hour=3, minute=0, day_of_week=0),
     },
 }
 

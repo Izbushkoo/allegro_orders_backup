@@ -9,6 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 from sqlmodel import SQLModel
+import sqlmodel
 ${imports if imports else ""}
 
 # revision identifiers, used by Alembic.

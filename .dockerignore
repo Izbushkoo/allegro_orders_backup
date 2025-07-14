@@ -59,3 +59,5 @@ temp/
 
 # Keep scripts directory
 !scripts/ 
+
+postgres_data/

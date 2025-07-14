@@ -12,7 +12,8 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.api.dependencies import DatabaseSession
+from app.api.dependencies import DatabaseSession, CurrentUserDep
+from app.core.auth import CurrentUser
 from app.services.token_service import TokenService
 from app.services.allegro_auth_service import AllegroAuthService
 from app.exceptions import NotFoundError, ValidationError, TokenNotFoundHTTPException, ValidationHTTPException, InternalServerErrorHTTPException
@@ -27,7 +28,6 @@ router = APIRouter()
 
 class TokenCreate(BaseModel):
     """Модель для создания токена"""
-    user_id: str = Field(..., description="Уникальный ID пользователя")
     allegro_token: str = Field(..., description="Токен доступа Allegro")
     refresh_token: str = Field(..., description="Токен для обновления")
     expires_at: datetime = Field(..., description="Дата истечения токена")
@@ -55,11 +55,10 @@ class TokenList(BaseModel):
     page: int
     per_page: int
 
-# Модели для Device Code Flow авторизации
-
 class AuthInitializeRequest(BaseModel):
     """Запрос на инициализацию авторизации"""
-    user_id: str = Field(..., description="ID пользователя для которого создается токен")
+    # user_id теперь берется из JWT токена
+    pass
 
 class AuthInitializeResponse(BaseModel):
     """Ответ с данными для авторизации"""
@@ -70,6 +69,10 @@ class AuthInitializeResponse(BaseModel):
     expires_in: int = Field(..., description="Время жизни кодов в секундах")
     interval: int = Field(..., description="Интервал проверки статуса в секундах")
     task_id: str = Field(..., description="ID задачи Celery для отслеживания прогресса")
+
+class AuthStatusRequest(BaseModel):
+    """Запрос на проверку статуса авторизации"""
+    device_code: str = Field(..., description="Код устройства")
 
 class AuthStatusResponse(BaseModel):
     """Ответ со статусом авторизации"""
@@ -83,31 +86,35 @@ class TaskStatusResponse(BaseModel):
     result: Optional[dict] = Field(None, description="Результат выполнения задачи")
     progress: Optional[dict] = Field(None, description="Информация о прогрессе")
 
-# API эндпоинты
+# Endpoints
 
 @router.post("/", response_model=TokenResponse, summary="Создать токен")
 async def create_token(
     token_data: TokenCreate,
+    current_user: CurrentUser = CurrentUserDep,
     db_session: AsyncSession = DatabaseSession
 ):
     """
-    Создать новый токен для пользователя.
+    Создать новый токен Allegro для текущего пользователя.
     
-    - **user_id**: Уникальный ID пользователя
-    - **allegro_token**: Токен доступа от Allegro
-    - **refresh_token**: Токен для обновления
+    **Требует аутентификации через JWT токен.**
+    
+    - **allegro_token**: Access token Allegro
+    - **refresh_token**: Refresh token Allegro  
     - **expires_at**: Дата истечения токена
     """
     try:
-        token_service = TokenService(db_session)
+        logger.info(f"Создание токена для пользователя {current_user.user_id}")
         
+        token_service = TokenService(db_session)
         token = await token_service.create_token(
-            user_id=token_data.user_id,
+            user_id=current_user.user_id,
             allegro_token=token_data.allegro_token,
             refresh_token=token_data.refresh_token,
             expires_at=token_data.expires_at
         )
         
+        logger.info(f"Токен успешно создан для пользователя {current_user.user_id}")
         return TokenResponse(
             id=token.id,
             user_id=token.user_id,
@@ -118,48 +125,59 @@ async def create_token(
         )
         
     except ValidationError as e:
-        logger.error(f"Validation error creating token: {str(e)}")
-        raise ValidationHTTPException(detail=str(e))
+        logger.error(f"Ошибка валидации при создании токена: {e}")
+        raise ValidationHTTPException(detail=f"Validation error: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error creating token: {str(e)}")
-        raise InternalServerErrorHTTPException(detail="Failed to create token")
+        logger.error(f"Неожиданная ошибка при создании токена: {e}")
+        raise InternalServerErrorHTTPException(detail="Internal server error")
 
-@router.get("/", response_model=TokenList, summary="Получить список токенов")
+
+@router.get("/", response_model=TokenList, summary="Получить токены пользователя")
 async def get_tokens(
     page: int = 1,
     per_page: int = 10,
-    user_id: Optional[str] = None,
     active_only: bool = True,
+    current_user: CurrentUser = CurrentUserDep,
     db_session: AsyncSession = DatabaseSession
 ):
     """
-    Получить список токенов с фильтрацией.
+    Получить список токенов текущего пользователя с пагинацией.
+    
+    **Требует аутентификации через JWT токен.**
     
     - **page**: Номер страницы (по умолчанию 1)
-    - **per_page**: Количество элементов на странице (по умолчанию 10)
-    - **user_id**: Фильтр по ID пользователя
-    - **active_only**: Только активные токены
+    - **per_page**: Количество элементов на странице (по умолчанию 10, максимум 100)
+    - **active_only**: Показывать только активные токены (по умолчанию true)
     """
     try:
-        token_service = TokenService(db_session)
+        # Валидация параметров
+        if page < 1:
+            page = 1
+        if per_page < 1:
+            per_page = 10
+        if per_page > 100:
+            per_page = 100
+            
+        logger.info(f"Получение токенов пользователя {current_user.user_id}, страница {page}")
         
+        token_service = TokenService(db_session)
         tokens, total = await token_service.get_tokens(
+            user_id=current_user.user_id,
             page=page,
             per_page=per_page,
-            user_id=user_id,
             active_only=active_only
         )
         
-        token_responses = []
-        for token in tokens:
-            token_responses.append(TokenResponse(
+        token_responses = [
+            TokenResponse(
                 id=token.id,
                 user_id=token.user_id,
                 expires_at=token.expires_at,
                 is_active=token.is_active,
                 created_at=token.created_at,
                 updated_at=token.updated_at
-            ))
+            ) for token in tokens
+        ]
         
         return TokenList(
             tokens=token_responses,
@@ -169,27 +187,34 @@ async def get_tokens(
         )
         
     except Exception as e:
-        logger.error(f"Error getting tokens: {str(e)}")
-        raise InternalServerErrorHTTPException(detail="Failed to get tokens")
+        logger.error(f"Ошибка при получении токенов: {e}")
+        raise InternalServerErrorHTTPException(detail="Internal server error")
+
 
 @router.get("/{token_id}", response_model=TokenResponse, summary="Получить токен")
 async def get_token(
     token_id: UUID,
+    current_user: CurrentUser = CurrentUserDep,
     db_session: AsyncSession = DatabaseSession
 ):
     """
-    Получить токен по ID.
+    Получить конкретный токен по ID.
     
-    - **token_id**: UUID токена
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может получить только свои токены.**
+    
+    - **token_id**: Уникальный идентификатор токена
     """
     try:
-        token_service = TokenService(db_session)
+        logger.info(f"Получение токена {token_id} для пользователя {current_user.user_id}")
         
-        token = await token_service.get_token(token_id)
+        token_service = TokenService(db_session)
+        token = await token_service.get_user_token_by_id(token_id, current_user.user_id)
         
         if not token:
+            logger.warning(f"Токен {token_id} не найден для пользователя {current_user.user_id}")
             raise TokenNotFoundHTTPException()
-        
+            
         return TokenResponse(
             id=token.id,
             user_id=token.user_id,
@@ -199,129 +224,167 @@ async def get_token(
             updated_at=token.updated_at
         )
         
-    except TokenNotFoundHTTPException:
-        raise
+    except NotFoundError:
+        logger.warning(f"Токен {token_id} не найден")
+        raise TokenNotFoundHTTPException()
     except Exception as e:
-        logger.error(f"Error getting token {token_id}: {str(e)}")
-        raise InternalServerErrorHTTPException(detail="Failed to get token")
+        logger.error(f"Ошибка при получении токена: {e}")
+        raise InternalServerErrorHTTPException(detail="Internal server error")
+
 
 @router.put("/{token_id}", response_model=TokenResponse, summary="Обновить токен")
 async def update_token(
     token_id: UUID,
     token_update: TokenUpdate,
+    current_user: CurrentUser = CurrentUserDep,
     db_session: AsyncSession = DatabaseSession
 ):
     """
-    Обновить токен пользователя.
+    Обновить существующий токен.
     
-    - **token_id**: UUID токена
-    - **allegro_token**: Новый токен доступа (необязательно)
-    - **refresh_token**: Новый токен для обновления (необязательно)
-    - **expires_at**: Новая дата истечения (необязательно)
-    - **is_active**: Статус активности (необязательно)
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может обновить только свои токены.**
+    
+    - **token_id**: Уникальный идентификатор токена
+    - **allegro_token**: Новый access token (опционально)
+    - **refresh_token**: Новый refresh token (опционально)
+    - **expires_at**: Новая дата истечения (опционально)
+    - **is_active**: Новый статус активности (опционально)
     """
     try:
+        logger.info(f"Обновление токена {token_id} для пользователя {current_user.user_id}")
+        
         token_service = TokenService(db_session)
         
-        # Подготавливаем данные для обновления
-        update_data = {}
-        if token_update.allegro_token is not None:
-            update_data["allegro_token"] = token_update.allegro_token
-        if token_update.refresh_token is not None:
-            update_data["refresh_token"] = token_update.refresh_token
-        if token_update.expires_at is not None:
-            update_data["expires_at"] = token_update.expires_at
-        if token_update.is_active is not None:
-            update_data["is_active"] = token_update.is_active
-        
-        token = await token_service.update_token(token_id, update_data)
-        
-        if not token:
+        # Проверяем, что токен принадлежит пользователю
+        existing_token = await token_service.get_user_token_by_id(token_id, current_user.user_id)
+        if not existing_token:
+            logger.warning(f"Токен {token_id} не найден для пользователя {current_user.user_id}")
             raise TokenNotFoundHTTPException()
         
-        return TokenResponse(
-            id=token.id,
-            user_id=token.user_id,
-            expires_at=token.expires_at,
-            is_active=token.is_active,
-            created_at=token.created_at,
-            updated_at=token.updated_at
+        # Обновляем токен
+        updated_token = await token_service.update_user_token(
+            token_id=token_id,
+            allegro_token=token_update.allegro_token,
+            refresh_token=token_update.refresh_token,
+            expires_at=token_update.expires_at,
+            is_active=token_update.is_active
         )
         
-    except TokenNotFoundHTTPException:
-        raise
+        if not updated_token:
+            logger.error(f"Не удалось обновить токен {token_id}")
+            raise InternalServerErrorHTTPException(detail="Failed to update token")
+            
+        logger.info(f"Токен {token_id} успешно обновлен")
+        return TokenResponse(
+            id=updated_token.id,
+            user_id=updated_token.user_id,
+            expires_at=updated_token.expires_at,
+            is_active=updated_token.is_active,
+            created_at=updated_token.created_at,
+            updated_at=updated_token.updated_at
+        )
+        
+    except NotFoundError:
+        logger.warning(f"Токен {token_id} не найден")
+        raise TokenNotFoundHTTPException()
     except ValidationError as e:
-        logger.error(f"Validation error updating token: {str(e)}")
-        raise ValidationHTTPException(detail=str(e))
+        logger.error(f"Ошибка валидации при обновлении токена: {e}")
+        raise ValidationHTTPException(detail=f"Validation error: {e}")
     except Exception as e:
-        logger.error(f"Error updating token {token_id}: {str(e)}")
-        raise InternalServerErrorHTTPException(detail="Failed to update token")
+        logger.error(f"Ошибка при обновлении токена: {e}")
+        raise InternalServerErrorHTTPException(detail="Internal server error")
+
 
 @router.delete("/{token_id}", summary="Удалить токен")
 async def delete_token(
     token_id: UUID,
+    current_user: CurrentUser = CurrentUserDep,
     db_session: AsyncSession = DatabaseSession
 ):
     """
-    Удалить токен (деактивировать).
+    Удалить (деактивировать) токен.
     
-    - **token_id**: UUID токена
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может удалить только свои токены.**
+    
+    - **token_id**: Уникальный идентификатор токена
     """
     try:
+        logger.info(f"Удаление токена {token_id} для пользователя {current_user.user_id}")
+        
         token_service = TokenService(db_session)
         
-        await token_service.deactivate_token(token_id)
+        # Проверяем, что токен принадлежит пользователю
+        existing_token = await token_service.get_user_token_by_id(token_id, current_user.user_id)
+        if not existing_token:
+            logger.warning(f"Токен {token_id} не найден для пользователя {current_user.user_id}")
+            raise TokenNotFoundHTTPException()
         
-        return {"message": "Token deleted successfully"}
+        success = await token_service.delete_user_token(token_id)
         
-    except NotFoundError as e:
-        logger.error(f"Token not found for deletion: {str(e)}")
+        if not success:
+            logger.error(f"Не удалось удалить токен {token_id}")
+            raise InternalServerErrorHTTPException(detail="Failed to delete token")
+            
+        logger.info(f"Токен {token_id} успешно удален")
+        return {"message": "Token successfully deleted"}
+        
+    except NotFoundError:
+        logger.warning(f"Токен {token_id} не найден")
         raise TokenNotFoundHTTPException()
     except Exception as e:
-        logger.error(f"Error deleting token {token_id}: {str(e)}")
-        raise InternalServerErrorHTTPException(detail="Failed to delete token")
+        logger.error(f"Ошибка при удалении токена: {e}")
+        raise InternalServerErrorHTTPException(detail="Internal server error")
 
 @router.post("/{token_id}/refresh", response_model=TokenResponse, summary="Обновить токен через refresh token")
 async def refresh_token(
     token_id: UUID,
+    current_user: CurrentUser = CurrentUserDep,
     db_session: AsyncSession = DatabaseSession
 ):
     """
-    Обновить токен используя refresh token через Allegro API.
+    Обновить access token используя refresh token.
     
-    - **token_id**: UUID токена для обновления
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может обновить только свои токены.**
+    
+    - **token_id**: Уникальный идентификатор токена
     """
     try:
+        logger.info(f"Обновление токена {token_id} через refresh token для пользователя {current_user.user_id}")
+        
         token_service = TokenService(db_session)
         
-        token = await token_service.get_token(token_id)
-        
-        if not token:
+        # Проверяем, что токен принадлежит пользователю
+        existing_token = await token_service.get_user_token_by_id(token_id, current_user.user_id)
+        if not existing_token:
+            logger.warning(f"Токен {token_id} не найден для пользователя {current_user.user_id}")
             raise TokenNotFoundHTTPException()
         
+        # Обновляем токен через сервис авторизации
         auth_service = AllegroAuthService(db_session)
-        refreshed_token = await auth_service.refresh_token(token)
+        updated_token = await auth_service.refresh_token(existing_token)
         
-        if not refreshed_token:
-            logger.error(f"Failed to refresh token: {token_id}")
-            raise ValidationHTTPException(detail="Failed to refresh token")
-        
+        if not updated_token:
+            logger.error(f"Не удалось обновить токен {token_id}")
+            raise InternalServerErrorHTTPException(detail="Failed to refresh token")
+            
+        logger.info(f"Токен {token_id} успешно обновлен через refresh token")
         return TokenResponse(
-            id=refreshed_token.id,
-            user_id=refreshed_token.user_id,
-            expires_at=refreshed_token.expires_at,
-            is_active=refreshed_token.is_active,
-            created_at=refreshed_token.created_at,
-            updated_at=refreshed_token.updated_at
+            id=updated_token.id,
+            user_id=updated_token.user_id,
+            expires_at=updated_token.expires_at,
+            is_active=updated_token.is_active,
+            created_at=updated_token.created_at,
+            updated_at=updated_token.updated_at
         )
         
-    except TokenNotFoundHTTPException:
-        raise
-    except ValidationError as e:
-        logger.error(f"Validation error refreshing token: {str(e)}")
-        raise ValidationHTTPException(detail=str(e))
+    except NotFoundError:
+        logger.warning(f"Токен {token_id} не найден")
+        raise TokenNotFoundHTTPException()
     except Exception as e:
-        logger.error(f"Error refreshing token {token_id}: {str(e)}")
+        logger.error(f"Ошибка при обновлении токена через refresh: {e}")
         raise InternalServerErrorHTTPException(detail="Failed to refresh token")
 
 @router.get("/user/{user_id}", response_model=List[TokenResponse], summary="Получить токены пользователя")
@@ -366,234 +429,162 @@ async def get_user_tokens(
 @router.post("/auth/initialize", response_model=AuthInitializeResponse, summary="Инициализация авторизации")
 async def initialize_auth(
     request: AuthInitializeRequest,
+    current_user: CurrentUser = CurrentUserDep,
     db_session: AsyncSession = DatabaseSession
 ):
     """
-    Инициализирует процесс авторизации через Device Code Flow для Allegro API.
+    Инициализировать процесс авторизации Device Code Flow для получения токенов Allegro.
     
-    Возвращает коды для авторизации пользователя:
-    - **device_code**: Используется для проверки статуса авторизации
-    - **user_code**: Код который пользователь должен ввести на странице авторизации
-    - **verification_uri**: URL страницы авторизации Allegro
-    - **expires_in**: Время жизни кодов в секундах
-    - **interval**: Рекомендуемый интервал проверки статуса в секундах
+    **Требует аутентификации через JWT токен.**
+    
+    Возвращает коды и URL для авторизации пользователя в Allegro.
+    Запускает фоновую задачу для polling статуса авторизации.
     """
-    logger.debug(f"[DEBUG] initialize_auth called with user_id: {request.user_id}")
-    
     try:
-        logger.debug(f"[DEBUG] Creating AllegroAuthService instance")
+        logger.info(f"Инициализация авторизации для пользователя {current_user.user_id}")
+        
         auth_service = AllegroAuthService(db_session)
         
-        logger.debug(f"[DEBUG] Calling auth_service.initialize_device_flow")
-        auth_data = await auth_service.initialize_device_flow(request.user_id)
+        # Инициализируем Device Code Flow
+        device_flow_data = await auth_service.initialize_device_flow(current_user.user_id)
         
-        logger.debug(f"[DEBUG] Auth data received: device_code={auth_data['device_code'][:10]}..., expires_in={auth_data['expires_in']}")
+        # Запускаем задачу polling
+        from datetime import timedelta
+        expires_at = datetime.utcnow() + timedelta(seconds=device_flow_data["expires_in"])
         
-        # Запускаем Celery задачу для автоматического polling авторизации
-        from datetime import datetime, timedelta
-        expires_at = datetime.utcnow() + timedelta(seconds=auth_data["expires_in"])
-        
-        # Используем уникальный task_id на основе device_code для предотвращения дублирования
-        import hashlib
-        unique_task_id = f"auth_{hashlib.md5(auth_data['device_code'].encode()).hexdigest()}"
-        
-        logger.debug(f"[DEBUG] Starting Celery task with ID: {unique_task_id}")
-        
-        task = poll_authorization_status.apply_async(
-            args=[
-                auth_data["device_code"],
-                request.user_id,
-                expires_at.isoformat(),
-                auth_data["interval"]
-            ],
-            task_id=unique_task_id
+        task = poll_authorization_status.delay(
+            device_code=device_flow_data["device_code"],
+            user_id=current_user.user_id,
+            expires_at_iso=expires_at.isoformat(),
+            interval_seconds=device_flow_data["interval"]
         )
         
-        logger.debug(f"[DEBUG] Task started successfully with ID: {task.id}")
+        logger.info(f"Авторизация инициализирована для пользователя {current_user.user_id}, task_id: {task.id}")
         
         return AuthInitializeResponse(
-            device_code=auth_data["device_code"],
-            user_code=auth_data["user_code"],
-            verification_uri=auth_data["verification_uri"],
-            verification_uri_complete=auth_data.get("verification_uri_complete"),
-            expires_in=auth_data["expires_in"],
-            interval=auth_data["interval"],
+            device_code=device_flow_data["device_code"],
+            user_code=device_flow_data["user_code"],
+            verification_uri=device_flow_data["verification_uri"],
+            verification_uri_complete=device_flow_data.get("verification_uri_complete"),
+            expires_in=device_flow_data["expires_in"],
+            interval=device_flow_data["interval"],
             task_id=task.id
         )
         
-    except ValidationError as e:
-        logger.error(f"Validation error during auth initialization: {str(e)}")
-        raise ValidationHTTPException(detail=str(e))
     except Exception as e:
-        logger.error(f"Unexpected error during auth initialization: {str(e)}")
+        logger.error(f"Ошибка при инициализации авторизации: {e}")
         raise InternalServerErrorHTTPException(detail="Failed to initialize authorization")
 
-@router.get("/auth/status/{device_code}", response_model=AuthStatusResponse, summary="Проверка статуса авторизации")
+
+@router.post("/auth/status", response_model=AuthStatusResponse, summary="Проверка статуса авторизации")
 async def check_auth_status(
-    device_code: str,
-    user_id: str,
+    request: AuthStatusRequest,
+    current_user: CurrentUser = CurrentUserDep,
     db_session: AsyncSession = DatabaseSession
 ):
     """
-    Проверяет статус авторизации для указанного device_code.
+    Проверить статус авторизации Device Code Flow.
     
-    Возвращает один из статусов:
-    - **pending**: Авторизация ещё не завершена пользователем
-    - **completed**: Авторизация успешно завершена, токен сохранён
-    - **failed**: Авторизация отклонена или произошла ошибка
+    **Требует аутентификации через JWT токен.**
     
-    - **device_code**: Код устройства полученный от /auth/initialize
-    - **user_id**: ID пользователя для которого проверяется авторизация
+    - **device_code**: Код устройства полученный при инициализации
     """
-    logger.debug(f"[DEBUG] check_auth_status called with device_code: {device_code[:10]}..., user_id: {user_id}")
-    
     try:
-        logger.debug(f"[DEBUG] Creating AllegroAuthService instance")
+        logger.info(f"Проверка статуса авторизации для пользователя {current_user.user_id}")
+        
         auth_service = AllegroAuthService(db_session)
-        
-        logger.debug(f"[DEBUG] Calling auth_service.check_auth_status")
-        status_data = await auth_service.check_auth_status(device_code, user_id)
-        
-        logger.debug(f"[DEBUG] Auth status received: {status_data}")
+        status_data = await auth_service.check_auth_status(
+            device_code=request.device_code,
+            user_id=current_user.user_id
+        )
         
         return AuthStatusResponse(
             status=status_data["status"],
             message=status_data.get("message")
         )
         
-    except ValidationError as e:
-        logger.error(f"Validation error during auth status check: {str(e)}")
-        raise ValidationHTTPException(detail=str(e))
     except Exception as e:
-        logger.error(f"Unexpected error during auth status check: {str(e)}")
+        logger.error(f"Ошибка при проверке статуса авторизации: {e}")
         raise InternalServerErrorHTTPException(detail="Failed to check authorization status")
+
 
 @router.post("/{token_id}/validate", response_model=TokenResponse, summary="Проверить и обновить токен")
 async def validate_and_refresh_token(
     token_id: UUID,
+    current_user: CurrentUser = CurrentUserDep,
     db_session: AsyncSession = DatabaseSession
 ):
     """
-    Проверяет токен и при необходимости обновляет его.
+    Проверить валидность токена и обновить его при необходимости.
     
-    Выполняет следующие действия:
-    1. Проверяет срок действия токена
-    2. Валидирует токен через Allegro API
-    3. Автоматически обновляет токен если он истёк или недействителен
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может проверить только свои токены.**
     
-    - **token_id**: UUID токена для проверки
+    - **token_id**: Уникальный идентификатор токена
     """
-    logger.debug(f"[DEBUG] validate_and_refresh_token called with token_id: {token_id}")
-    
     try:
-        logger.debug(f"[DEBUG] Creating TokenService instance")
+        logger.info(f"Валидация токена {token_id} для пользователя {current_user.user_id}")
+        
         token_service = TokenService(db_session)
         
-        logger.debug(f"[DEBUG] Getting token from database")
-        token = await token_service.get_token(token_id)
-        
-        if not token:
+        # Проверяем, что токен принадлежит пользователю
+        existing_token = await token_service.get_user_token_by_id(token_id, current_user.user_id)
+        if not existing_token:
+            logger.warning(f"Токен {token_id} не найден для пользователя {current_user.user_id}")
             raise TokenNotFoundHTTPException()
         
-        logger.debug(f"[DEBUG] Token found, creating AllegroAuthService")
-        auth_service = AllegroAuthService(db_session)
-        logger.debug(f"[DEBUG] Calling auth_service.check_and_refresh_token")
+        # Проверяем и обновляем токен
+        validated_token = await token_service.validate_and_refresh_token(token_id)
         
-        updated_token = await auth_service.check_and_refresh_token(token)
-        
-        if not updated_token:
-            logger.error(f"Failed to validate or refresh token: {token_id}")
-            raise ValidationHTTPException(detail="Failed to validate or refresh token")
-        
+        if not validated_token:
+            logger.error(f"Не удалось валидировать токен {token_id}")
+            raise InternalServerErrorHTTPException(detail="Failed to validate token")
+            
+        logger.info(f"Токен {token_id} успешно валидирован")
         return TokenResponse(
-            id=updated_token.id,
-            user_id=updated_token.user_id,
-            expires_at=updated_token.expires_at,
-            is_active=updated_token.is_active,
-            created_at=updated_token.created_at,
-            updated_at=updated_token.updated_at
+            id=validated_token.id,
+            user_id=validated_token.user_id,
+            expires_at=validated_token.expires_at,
+            is_active=validated_token.is_active,
+            created_at=validated_token.created_at,
+            updated_at=validated_token.updated_at
         )
         
-    except TokenNotFoundHTTPException:
-        raise
-    except ValidationError as e:
-        logger.error(f"Validation error during token validation: {str(e)}")
-        raise ValidationHTTPException(detail=str(e))
+    except NotFoundError:
+        logger.warning(f"Токен {token_id} не найден")
+        raise TokenNotFoundHTTPException()
     except Exception as e:
-        logger.error(f"Unexpected error during token validation: {str(e)}")
+        logger.error(f"Ошибка при валидации токена: {e}")
         raise InternalServerErrorHTTPException(detail="Failed to validate token")
 
+
 @router.get("/auth/task/{task_id}", response_model=TaskStatusResponse, summary="Проверка статуса задачи авторизации")
-async def get_auth_task_status(task_id: str):
+async def get_auth_task_status(
+    task_id: str,
+    current_user: CurrentUser = CurrentUserDep
+):
     """
-    Проверяет статус выполнения задачи авторизации.
+    Получить статус задачи авторизации Celery.
     
-    Возвращает информацию о прогрессе автоматического polling'а авторизации:
-    - **PENDING**: Задача ещё выполняется
-    - **SUCCESS**: Авторизация завершена (успешно или с ошибкой)
-    - **FAILURE**: Критическая ошибка в задаче
+    **Требует аутентификации через JWT токен.**
     
-    - **task_id**: ID задачи полученный от /auth/initialize
+    - **task_id**: Идентификатор задачи полученный при инициализации авторизации
     """
-    logger.debug(f"[DEBUG] get_auth_task_status called with task_id: {task_id}")
-    
     try:
+        logger.info(f"Проверка статуса задачи {task_id} для пользователя {current_user.user_id}")
+        
+        from celery.result import AsyncResult
         from app.celery_app import celery_app
         
-        logger.debug(f"[DEBUG] Getting task result from Celery")
-        task_result = celery_app.AsyncResult(task_id)
+        task_result = AsyncResult(task_id, app=celery_app)
         
-        logger.debug(f"[DEBUG] Task state: {task_result.state}")
-        
-        if task_result.state == 'PENDING':
-            response = {
-                "task_id": task_id,
-                "status": "PENDING",
-                "progress": {
-                    "message": "Authorization polling in progress...",
-                    "current_step": "Waiting for user authorization"
-                }
-            }
-        elif task_result.state == 'SUCCESS':
-            result = task_result.result
-            logger.debug(f"[DEBUG] Task result: {result}")
-            response = {
-                "task_id": task_id,
-                "status": "SUCCESS",
-                "result": result,
-                "progress": {
-                    "message": f"Authorization {result.get('status', 'completed')}",
-                    "current_step": "Finished"
-                }
-            }
-        elif task_result.state == 'FAILURE':
-            logger.debug(f"[DEBUG] Task failed with error: {task_result.info}")
-            response = {
-                "task_id": task_id,
-                "status": "FAILURE",
-                "result": {
-                    "status": "failed",
-                    "message": str(task_result.info)
-                },
-                "progress": {
-                    "message": "Task failed with error",
-                    "current_step": "Error"
-                }
-            }
-        else:
-            # Другие состояния (RETRY, REVOKED, etc.)
-            logger.debug(f"[DEBUG] Task in other state: {task_result.state}")
-            response = {
-                "task_id": task_id,
-                "status": task_result.state,
-                "progress": {
-                    "message": f"Task in state: {task_result.state}",
-                    "current_step": "Processing"
-                }
-            }
-        
-        return TaskStatusResponse(**response)
+        return TaskStatusResponse(
+            task_id=task_id,
+            status=task_result.status,
+            result=task_result.result if task_result.successful() else None,
+            progress=task_result.info if task_result.status == "PROGRESS" else None
+        )
         
     except Exception as e:
-        logger.error(f"Error getting task status for {task_id}: {str(e)}")
+        logger.error(f"Ошибка при получении статуса задачи: {e}")
         raise InternalServerErrorHTTPException(detail="Failed to get task status")

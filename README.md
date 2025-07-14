@@ -222,3 +222,53 @@ docs/               # Документация проекта
 ## Лицензия
 
 Этот проект лицензирован под MIT License. 
+
+## 🧪 Быстрое тестирование
+
+### 1. Запустить контейнеры
+```bash
+docker-compose up -d
+```
+
+### 2. Создать тестовый JWT токен
+```bash
+curl -X POST "http://localhost:8000/test-jwt/create?user_id=testuser&username=testing"
+```
+Скопируйте `access_token` из ответа.
+
+### 3. Проверить JWT аутентификацию
+```bash
+curl -X GET "http://localhost:8000/test-jwt" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### 4. Тестировать синхронизацию заказов
+```bash
+curl -X POST "http://localhost:8000/api/v1/sync/test" \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json"
+```
+
+### 5. Проверить логи
+```bash
+docker-compose logs -f allegro_app
+```
+
+В логах вы увидите:
+- Извлечение `user_id` из JWT токена
+- Процесс синхронизации с Allegro API
+- Защита данных и мониторинг качества
+
+## 📋 API Documentation
+
+Swagger UI: http://localhost:8000/docs  
+ReDoc: http://localhost:8000/redoc
+
+## 🎯 Основные endpoints
+
+- **JWT Test**: `POST /test-jwt/create` - создание тестового токена
+- **JWT Auth**: `GET /test-jwt` - проверка аутентификации
+- **Sync Test**: `POST /api/v1/sync/test` - тестовая синхронизация
+- **Full Sync**: `POST /api/v1/sync/start` - полная синхронизация
+- **Tokens**: `/api/v1/tokens/*` - управление токенами Allegro
+- **Orders**: `/api/v1/orders/*` - работа с заказами 
