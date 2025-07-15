@@ -153,7 +153,7 @@ def poll_authorization_status(self, device_code: str, user_id: str, expires_at_i
 
 
 @celery_app.task(bind=True)
-def refresh_all_tokens_with_history(self):
+def refresh_all_tokens(self):
     """
     Массовое обновление всех токенов с фиксацией истории выполнения в TaskHistory.
     """

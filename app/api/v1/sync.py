@@ -96,7 +96,7 @@ class SyncTaskResponse(BaseModel):
 class TaskHistoryRead(BaseModel):
     id: UUID
     task_id: str
-    user_id: UUID
+    user_id: str
     task_type: str
     status: str
     params: Dict[str, Any]
@@ -128,6 +128,8 @@ async def start_sync(
 ):
     """
     Запустить синхронизацию заказов для текущего пользователя через Celery.
+    Если указать параметр sync_from_date будут получены заказы с этой даты, без фактического получения событий заказов.
+    Если параметр sync_from_date не указан, будут получены события заказов с момента последнего имеющегося в базе события заказа.
     
     **Требует аутентификации через JWT токен.**
     
@@ -345,7 +347,7 @@ async def get_task_status(
     current_user: CurrentUser = CurrentUserDep
 ):
     """
-    Получить статус задачи синхронизации Celery.
+    Получить статус задачи синхронизации Celery. Результат из бекенда Celery.
     
     **Требует аутентификации через JWT токен.**
     """

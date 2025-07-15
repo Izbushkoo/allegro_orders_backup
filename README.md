@@ -61,6 +61,9 @@ docker compose exec app poetry run alembic revision --autogenerate -m "Initial m
 
 # Применение миграций
 docker compose exec app poetry run alembic upgrade head
+
+# Инициализация таблиц для Celery Beat (только после успешного применения миграций)
+make init-celery-beat
 ```
 
 ## Разработка
