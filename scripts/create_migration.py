@@ -49,6 +49,8 @@ def create_migration(message: str = None, autogenerate: bool = True):
         os.chdir(PROJECT_ROOT)
         
         logger.info(f"Running command: {' '.join(cmd)}")
+        logger.info(f"Working directory: {os.getcwd()}")
+        
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         
         logger.info("Migration created successfully!")
@@ -75,6 +77,7 @@ def upgrade_database():
         
         cmd = ["alembic", "upgrade", "head"]
         logger.info(f"Running command: {' '.join(cmd)}")
+        logger.info(f"Working directory: {os.getcwd()}")
         
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         
@@ -99,6 +102,9 @@ def show_current_revision():
         os.chdir(PROJECT_ROOT)
         
         cmd = ["alembic", "current"]
+        logger.info(f"Running command: {' '.join(cmd)}")
+        logger.info(f"Working directory: {os.getcwd()}")
+        
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         
         logger.info("Current database revision:")
@@ -116,6 +122,9 @@ def show_migration_history():
         os.chdir(PROJECT_ROOT)
         
         cmd = ["alembic", "history", "--verbose"]
+        logger.info(f"Running command: {' '.join(cmd)}")
+        logger.info(f"Working directory: {os.getcwd()}")
+        
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         
         logger.info("Migration history:")

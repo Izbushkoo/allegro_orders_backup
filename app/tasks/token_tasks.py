@@ -23,12 +23,13 @@ logger = get_logger(__name__)
 
 
 @celery_app.task(bind=True, max_retries=30, rate_limit='10/m')
-def poll_authorization_status(self, device_code: str, user_id: str, expires_at_iso: str, interval_seconds: int = 5):
+def poll_authorization_status(self, device_code: str, user_id: str, account_name: str, expires_at_iso: str, interval_seconds: int = 5):
     """
     Задача для отслеживания статуса авторизации Device Code Flow (sync).
     Args:
         device_code: Код устройства для проверки
         user_id: ID пользователя
+        account_name: Название аккаунта Allegro
         expires_at_iso: Время истечения в ISO формате
         interval_seconds: Интервал проверки в секундах
     """
@@ -67,7 +68,7 @@ def poll_authorization_status(self, device_code: str, user_id: str, expires_at_i
         try:
             auth_service = AllegroAuthService(sync_session)
             logger.debug(f"[DEBUG] Calling auth_service.check_auth_status_sync")
-            result = auth_service.check_auth_status_sync(device_code, user_id)
+            result = auth_service.check_auth_status_sync(device_code, user_id, account_name)
             logger.debug(f"[DEBUG] Authorization check result: {result}")
         finally:
             logger.debug(f"[DEBUG] Closing sync DB session")

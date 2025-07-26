@@ -15,12 +15,15 @@ from alembic import context
 # Добавляем путь к приложению
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-# Импортируем настройки и модели
+# Импортируем настройки
 from app.core.settings import settings
-from app.models import *  # Импортируем все модели
-from app.models.base import BaseModel
-from app.models.task_history import TaskHistory
-from app.models.active_sync_schedule import ActiveSyncSchedule
+
+# Dynamically import all model modules for autogeneration
+import pkgutil
+import importlib
+import app.models
+for finder, module_name, ispkg in pkgutil.iter_modules(app.models.__path__):
+    importlib.import_module(f"app.models.{module_name}")
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

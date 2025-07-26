@@ -73,7 +73,7 @@ celery_app.conf.beat_schedule = {
     # Обновление токенов каждые 30 минут
     "refresh-tokens": {
         "task": "app.tasks.token_tasks.refresh_all_tokens",
-        "schedule": crontab(minute="*/30"),
+        "schedule": crontab(minute="*/10"),
     },
 }
 

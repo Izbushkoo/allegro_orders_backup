@@ -39,6 +39,9 @@
 - `GET /api/v1/orders/events/` - События заказов
 - `GET /api/v1/orders/{order_id}/events` - События заказа
 
+#### **Offers** - Работа с офферами
+- `POST /api/v1/offers/update-stock` - Обновление запаса офферов
+
 #### **Sync** - Синхронизация
 - `POST /api/v1/sync/start` - Запустить синхронизацию
 - `POST /api/v1/sync/start/user/{user_id}` - Синхронизация пользователя

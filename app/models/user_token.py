@@ -20,7 +20,11 @@ class UserToken(BaseModel, table=True):
     
     user_id: str = Field(
         index=True,
-        description="Идентификатор пользователя из JWT токена"
+        description="Идентификатор пользователя или сервиса из JWT токена"
+    )
+    
+    account_name: str = Field(
+        description="Название аккаунта Allegro для удобства идентификации"
     )
     
     allegro_token: str = Field(
@@ -40,14 +44,16 @@ class UserToken(BaseModel, table=True):
         description="Активен ли токен"
     )
     
-
-    # Ограничения для контроля дублирования токенов
-    # Не используем unique constraint, так как пользователь может иметь несколько токенов для одного аккаунта
+    # Уникальное ограничение на пару user_id + account_name
+    __table_args__ = (
+        UniqueConstraint('user_id', 'account_name', name='unique_user_account'),
+    )
 
 
 class UserTokenCreate(SQLModel):
     """Схема для создания нового токена"""
     user_id: str
+    account_name: str
     allegro_token: str
     refresh_token: str
     expires_at: datetime
@@ -59,6 +65,7 @@ class UserTokenRead(SQLModel):
     
     id: UUID
     user_id: str
+    account_name: str
     expires_at: datetime
     is_active: bool
     created_at: datetime
@@ -68,6 +75,7 @@ class UserTokenRead(SQLModel):
 class UserTokenUpdate(SQLModel):
     """Схема для обновления токена"""
     
+    account_name: Optional[str] = None
     allegro_token: Optional[str] = None
     refresh_token: Optional[str] = None
     expires_at: Optional[datetime] = None

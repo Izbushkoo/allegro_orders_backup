@@ -411,9 +411,10 @@ class OrderSyncService:
     def _get_last_event_id_from_db(self) -> Optional[str]:
         """
         Получает последний event_id из базы данных для правильной пагинации Events API.
+        Если event_id не найден, получает текущую точку через Allegro API Statistics.
         
         Returns:
-            Optional[str]: Последний event_id или None если событий нет
+            Optional[str]: Последний event_id или None если ошибка
         """
         try:
             from sqlmodel import select, desc
@@ -429,15 +430,141 @@ class OrderSyncService:
             last_event = self.db.exec(query).first()
             
             if last_event and last_event.event_id:
-                logger.info(f"🔍 Найден последний event_id: {last_event.event_id}")
+                logger.info(f"🔍 Найден последний event_id в БД: {last_event.event_id}")
                 return last_event.event_id
             else:
-                logger.info("🔍 Последний event_id не найден, начинаем с начала")
-                return None
+                logger.info("🔍 Event_id в БД не найден, получаем текущую точку от Allegro API")
+                
+                # Получаем текущую точку событий от Allegro API
+                current_event_id = self._get_current_event_point_from_api()
+                
+                if current_event_id:
+                    # Сохраняем стартовую точку в БД как специальное событие
+                    self._save_starting_point_event(current_event_id)
+                    logger.info(f"🎯 Установлена стартовая точка event_id: {current_event_id}")
+                    return current_event_id
+                else:
+                    logger.warning("⚠️ Не удалось получить текущую точку событий")
+                    return None
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка при получении последнего event_id: {e}")
+            logger.error(f"❌ Ошибка при получении event_id: {e}")
             return None
+
+    def _get_current_event_point_from_api(self) -> Optional[str]:
+        """
+        Получает текущую точку событий от Allegro API через Statistics endpoint.
+        
+        Использует API: GET /order/events/statistics
+        
+        Returns:
+            Optional[str]: Текущий event_id или None при ошибке
+        """
+        
+        try:
+            # Получаем токен пользователя
+            from sqlmodel import select
+            from app.models.user_token import UserToken
+            from uuid import UUID
+            
+            try:
+                token_uuid = UUID(self.token_id)
+                query = select(UserToken).where(
+                    UserToken.id == token_uuid,
+                    UserToken.user_id == self.user_id,
+                    UserToken.is_active == True,
+                    UserToken.expires_at > datetime.utcnow()
+                )
+                
+                token_record = self.db.exec(query).first()
+                if not token_record:
+                    logger.error(f"❌ Токен {self.token_id} недействителен или не принадлежит пользователю {self.user_id}")
+                    return None
+                    
+                token = token_record.allegro_token
+                logger.info(f"✅ Получение текущей точки событий для токена {self.token_id}")
+                
+            except ValueError:
+                logger.error(f"❌ Некорректный UUID токена: {self.token_id}")
+                return None
+                
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.allegro.public.v1+json"
+            }
+            
+            # URL для получения статистики событий
+            url = "https://api.allegro.pl/order/events/statistics"
+            
+            # Выполняем запрос к Allegro API
+            with httpx.Client() as client:
+                response = client.get(url, headers=headers, timeout=30.0)
+                response.raise_for_status()
+                
+                data = response.json()
+                latest_event = data.get("latestEvent", {})
+                
+                event_id = latest_event.get("id")
+                occurred_at = latest_event.get("occurredAt")
+                
+                if event_id:
+                    logger.info(f"📊 Получена текущая точка событий: id={event_id}, time={occurred_at}")
+                    return event_id
+                else:
+                    logger.warning("⚠️ В ответе API отсутствует event_id")
+                    return None
+                
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ HTTP ошибка при получении статистики событий: {e.response.status_code}")
+            logger.error(f"❌ Ответ API: {e.response.text}")
+            return None
+            
+        except httpx.TimeoutException:
+            logger.error("❌ Timeout при получении статистики событий от Allegro API")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Неожиданная ошибка при получении статистики событий: {e}")
+            return None
+
+    def _save_starting_point_event(self, event_id: str):
+        """
+        Сохраняет стартовую точку событий как специальное событие в БД.
+        
+        Это позволит в будущем корректно продолжить синхронизацию с этой точки.
+        
+        Args:
+            event_id: ID события - стартовая точка для синхронизации
+        """
+        
+        from app.models.order_event import OrderEvent
+        
+        try:
+            # Создаем специальное событие для маркировки стартовой точки
+            starting_point_event = OrderEvent(
+                order_id=None,  # Это не связано с конкретным заказом
+                token_id=self.token_id,
+                event_type="SYNC_STARTING_POINT",
+                event_data={
+                    "event_id": event_id,
+                    "purpose": "starting_point_for_incremental_sync",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "source": "allegro_events_statistics_api"
+                },
+                occurred_at=datetime.utcnow(),
+                event_id=event_id,  # Сохраняем event_id для пагинации
+                is_duplicate=False
+            )
+            
+            self.db.add(starting_point_event)
+            self.db.commit()
+            
+            logger.info(f"📍 Сохранена стартовая точка событий: event_id={event_id}")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения стартовой точки событий: {e}")
+            self.db.rollback()
+            # Не прерываем процесс из-за ошибки сохранения стартовой точки
 
     def _fetch_order_events_safe(self, from_event_id: Optional[str] = None, sync_to_date: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """

@@ -225,28 +225,64 @@ sequenceDiagram
 
 ### Стратегия синхронизации
 
-**Event-driven подход**:
-1. **Мониторинг событий**: Регулярный опрос GET /order/events
-2. **Типы событий**:
-   - ORDER_STATUS_CHANGED - изменение статуса заказа
-   - PAYMENT_STATUS_CHANGED - изменение статуса платежа
-   - DELIVERY_INFO_CHANGED - изменение данных доставки
-   - ORDER_CANCELLED - отмена заказа
+Система реализует **двухуровневую стратегию синхронизации**:
 
-3. **Алгоритм обработки**:
-   ```python
-   # Псевдокод синхронизации
-   last_sync = get_last_sync_timestamp(token_id)
-   events = allegro_client.get_order_events(from=last_sync)
-   
-   for event in events:
-       if event.type in TRACKED_EVENTS:
-           order_data = allegro_client.get_order_details(event.order.id)
-           upsert_order(token_id, event.order.id, order_data)
-           save_order_event(event)
-   
-   update_sync_timestamp(token_id, now())
-   ```
+#### 1. **Грубая синхронизация** (Bulk Sync)
+- **API**: GET /order/checkout-forms
+- **Триггер**: При указании параметра `sync_from_date`
+- **Назначение**: Первичная загрузка или массовая синхронизация за период
+- **Особенности**:
+  - Получение заказов напрямую с фильтрацией по датам
+  - Эффективна для больших периодов времени
+  - Не создает события в базе данных (обрабатывает заказы напрямую)
+  
+#### 2. **Тонкая синхронизация** (Incremental Sync)
+- **API**: GET /order/events + GET /order/events/statistics
+- **Триггер**: Без указания `sync_from_date` (автоматическая и периодическая)
+- **Назначение**: Отслеживание изменений в реальном времени
+- **Особенности**:
+  - Автоматическое получение стартовой точки при первом запуске
+  - Сохранение всех событий в базе данных для audit trail
+  - Продолжение с последней обработанной точки
+
+#### **Автоматическое получение стартовой точки**:
+```python
+def _get_last_event_id_from_db():
+    # 1. Ищем последний event_id в базе данных
+    last_event = db.query(OrderEvent).order_by(desc(occurred_at)).first()
+    
+    if last_event and last_event.event_id:
+        return last_event.event_id
+    else:
+        # 2. Если event_id не найден → вызываем API Statistics
+        current_point = allegro_client.get_events_statistics()
+        event_id = current_point['latestEvent']['id']
+        
+        # 3. Сохраняем стартовую точку как специальное событие
+        save_starting_point_event(event_id)
+        return event_id
+```
+
+#### **Типы событий**:
+- ORDER_STATUS_CHANGED - изменение статуса заказа
+- PAYMENT_STATUS_CHANGED - изменение статуса платежа  
+- DELIVERY_INFO_CHANGED - изменение данных доставки
+- ORDER_CANCELLED - отмена заказа
+- SYNC_STARTING_POINT - специальное событие для маркировки начала синхронизации
+
+#### **Алгоритм выбора стратегии**:
+```python
+def sync_orders_safe(sync_from_date=None):
+    if sync_from_date:
+        # Грубая синхронизация через Checkout Forms API
+        orders_data = fetch_orders_by_date(sync_from_date, sync_to_date)
+        # Обрабатываем заказы напрямую без создания событий
+    else:
+        # Тонкая синхронизация через Events API
+        from_event_id = get_last_event_id_from_db()  # Автоматически получает стартовую точку
+        events_data = fetch_order_events(from_event_id=from_event_id)
+        # Сохраняем все события + обрабатываем заказы
+```
 
 ### Rate Limiting и Error Handling
 
@@ -600,8 +636,8 @@ volumes:
 
 ---
 
-**Версия документа**: 1.1  
+**Версия документа**: 1.2  
 **Дата создания**: 2024-01-15  
-**Последнее обновление**: 2024-01-21  
+**Последнее обновление**: 2025-01-18  
 **Автор**: System Architect  
-**Статус**: В разработке - Device Code Flow реализован 
+**Статус**: Production Ready - Автоматическое получение стартовой точки событий реализовано 

@@ -13,9 +13,11 @@ import httpx
 from app.models.order import Order
 from app.models.order_event import OrderEvent
 from app.models.sync_history import SyncHistory
+from app.models.order_technical_flags import OrderTechnicalFlags
 from app.services.order_protection_service import OrderProtectionService, DataIntegrityError
 from app.services.data_monitoring_service import DataMonitoringService
 from app.services.allegro_auth_service import AllegroAuthService
+from app.services.order_technical_flags_service import OrderTechnicalFlagsService
 from app.core.database import get_sync_db_session_direct
 
 logger = logging.getLogger(__name__)
@@ -187,6 +189,24 @@ class OrderService:
                 response.raise_for_status()
                 order_data = response.json()
                 
+                # Получаем технические флаги для заказа
+                technical_data = None
+                try:
+                    with OrderTechnicalFlagsService(self.user_id, self.token_id) as flags_service:
+                        flags = flags_service.get_or_create_flags(order_id)
+                        technical_data = {
+                            "is_stock_updated": flags.is_stock_updated,
+                            "has_invoice_created": flags.has_invoice_created,
+                            "invoice_id": flags.invoice_id,
+                            "created_at": flags.created_at.isoformat(),
+                            "updated_at": flags.updated_at.isoformat()
+                        }
+                except Exception as e:
+                    logger.warning(f"Не удалось получить технические флаги для заказа {order_id}: {e}")
+                
+                # Добавляем технические флаги к данным заказа
+                order_data["technical_flags"] = technical_data
+                
                 result.update({
                     "success": True,
                     "order": order_data
@@ -259,7 +279,10 @@ class OrderService:
                        offset: int = 0,
                        status_filter: Optional[str] = None,
                        from_date: Optional[datetime] = None,
-                       to_date: Optional[datetime] = None) -> Dict[str, Any]:
+                       to_date: Optional[datetime] = None,
+                       stock_updated_filter: Optional[bool] = None,
+                       invoice_created_filter: Optional[bool] = None,
+                       invoice_id_filter: Optional[str] = None) -> Dict[str, Any]:
         """
         Получение списка заказов из локальной БД с фильтрацией.
         
@@ -269,18 +292,49 @@ class OrderService:
             status_filter: Фильтр по статусу заказа
             from_date: Заказы от указанной даты
             to_date: Заказы до указанной даты
+            stock_updated_filter: Фильтр по флагу обновления стока
+            invoice_created_filter: Фильтр по флагу создания инвойса
+            invoice_id_filter: Фильтр по конкретному ID инвойса
             
         Returns:
             Dict: Список заказов с метаданными
         """
         
         try:
-            # Строим базовый запрос
-            query = select(Order)
+            # Проверяем, нужны ли фильтры по техническим флагам
+            need_flags_join = any([
+                stock_updated_filter is not None,
+                invoice_created_filter is not None,
+                invoice_id_filter is not None
+            ])
             
-            # Применяем фильтры
+            if need_flags_join:
+                # Строим запрос с JOIN по техническим флагам
+                query = select(Order).join(
+                    OrderTechnicalFlags,
+                    Order.allegro_order_id == OrderTechnicalFlags.allegro_order_id
+                ).where(
+                    Order.token_id == self.token_id,
+                    OrderTechnicalFlags.token_id == self.token_id
+                )
+                
+                # Применяем фильтры по техническим флагам
+                if stock_updated_filter is not None:
+                    query = query.where(OrderTechnicalFlags.is_stock_updated == stock_updated_filter)
+                    
+                if invoice_created_filter is not None:
+                    query = query.where(OrderTechnicalFlags.has_invoice_created == invoice_created_filter)
+                    
+                if invoice_id_filter:
+                    query = query.where(OrderTechnicalFlags.invoice_id == invoice_id_filter)
+                    
+            else:
+                # Строим базовый запрос без JOIN
+                query = select(Order).where(Order.token_id == self.token_id)
+            
+            # Применяем остальные фильтры
             if status_filter:
-                query = query.where(Order.status == status_filter)
+                query = query.where(Order.order_data['status'].as_string() == status_filter)
                 
             if from_date:
                 query = query.where(Order.created_at >= from_date)
@@ -294,10 +348,31 @@ class OrderService:
             # Выполняем запрос
             orders = self.db.exec(query).all()
             
-            # Получаем общее количество (для пагинации)
-            count_query = select(func.count(Order.id))
+            # Получаем общее количество (для пагинации) с теми же фильтрами
+            if need_flags_join:
+                count_query = select(func.count(Order.id)).join(
+                    OrderTechnicalFlags,
+                    Order.allegro_order_id == OrderTechnicalFlags.allegro_order_id
+                ).where(
+                    Order.token_id == self.token_id,
+                    OrderTechnicalFlags.token_id == self.token_id
+                )
+                
+                # Применяем фильтры по техническим флагам для подсчета
+                if stock_updated_filter is not None:
+                    count_query = count_query.where(OrderTechnicalFlags.is_stock_updated == stock_updated_filter)
+                    
+                if invoice_created_filter is not None:
+                    count_query = count_query.where(OrderTechnicalFlags.has_invoice_created == invoice_created_filter)
+                    
+                if invoice_id_filter:
+                    count_query = count_query.where(OrderTechnicalFlags.invoice_id == invoice_id_filter)
+            else:
+                count_query = select(func.count(Order.id)).where(Order.token_id == self.token_id)
+                
+            # Применяем остальные фильтры для подсчета
             if status_filter:
-                count_query = count_query.where(Order.status == status_filter)
+                count_query = count_query.where(Order.order_data['status'].as_string() == status_filter)
             if from_date:
                 count_query = count_query.where(Order.created_at >= from_date)
             if to_date:
@@ -305,21 +380,24 @@ class OrderService:
                 
             total_count = self.db.exec(count_query).one()
             
+            # Получаем технические флаги для всех заказов одним запросом
+            order_ids = [order.allegro_order_id for order in orders]
+            technical_flags = {}
+            if order_ids:
+                try:
+                    with OrderTechnicalFlagsService(self.user_id, self.token_id) as flags_service:
+                        technical_flags = flags_service.get_multiple_flags(order_ids)
+                        
+                        # Данные уже извлечены как обычные Python объекты
+                                
+                except Exception as e:
+                    logger.warning(f"Не удалось получить технические флаги для заказов: {e}")
+                    technical_flags = {}
+            
             # Конвертируем в dict для API
             orders_data = []
             for order in orders:
-                order_dict = {
-                    "id": order.id,
-                    "order_id": order.order_id,
-                    "status": order.status,
-                    "buyer_data": order.buyer_data,
-                    "total_price_amount": order.total_price_amount,
-                    "total_price_currency": order.total_price_currency,
-                    "line_items_count": len(order.line_items or []),
-                    "created_at": order.created_at.isoformat() if order.created_at else None,
-                    "updated_at": order.updated_at.isoformat() if order.updated_at else None,
-                    "allegro_revision": order.order_data.get("revision")
-                }
+                order_dict = self._format_order_data(order, technical_flags.get(order.allegro_order_id))
                 orders_data.append(order_dict)
                 
             return {
@@ -335,7 +413,10 @@ class OrderService:
                 "filters": {
                     "status": status_filter,
                     "from_date": from_date.isoformat() if from_date else None,
-                    "to_date": to_date.isoformat() if to_date else None
+                    "to_date": to_date.isoformat() if to_date else None,
+                    "stock_updated": stock_updated_filter,
+                    "invoice_created": invoice_created_filter,
+                    "invoice_id": invoice_id_filter
                 }
             }
             
@@ -348,13 +429,21 @@ class OrderService:
                 "pagination": {"total": 0, "limit": limit, "offset": offset}
             }
             
-    def search_orders(self, search_query: str, limit: int = 50) -> Dict[str, Any]:
+    def search_orders(self, 
+                     search_query: str, 
+                     limit: int = 50,
+                     stock_updated_filter: Optional[bool] = None,
+                     invoice_created_filter: Optional[bool] = None,
+                     invoice_id_filter: Optional[str] = None) -> Dict[str, Any]:
         """
         Поиск заказов по различным критериям.
         
         Args:
             search_query: Поисковый запрос (email покупателя, ID заказа, имя)
             limit: Максимальное количество результатов
+            stock_updated_filter: Фильтр по флагу обновления стока
+            invoice_created_filter: Фильтр по флагу создания инвойса
+            invoice_id_filter: Фильтр по конкретному ID инвойса
             
         Returns:
             Dict: Результаты поиска
@@ -363,41 +452,105 @@ class OrderService:
         try:
             search_term = f"%{search_query.lower()}%"
             
-            # Ищем по различным полям
-            query = select(Order).where(
-                Order.order_id.ilike(search_term) |  # По ID заказа
-                Order.buyer_data["email"].as_string().ilike(search_term) |  # По email
-                Order.buyer_data["firstName"].as_string().ilike(search_term) |  # По имени
-                Order.buyer_data["lastName"].as_string().ilike(search_term)  # По фамилии
-            ).order_by(Order.created_at.desc()).limit(limit)
+            # Проверяем, нужны ли фильтры по техническим флагам
+            need_flags_join = any([
+                stock_updated_filter is not None,
+                invoice_created_filter is not None,
+                invoice_id_filter is not None
+            ])
             
-            orders = self.db.exec(query).all()
+            # Формируем базовые условия поиска
+            search_conditions = (
+                # Поиск по ID заказа
+                Order.order_data['id'].as_string().ilike(search_term) |
+                # Поиск по email покупателя
+                Order.order_data['buyer']['email'].as_string().ilike(search_term) |
+                # Поиск по имени покупателя
+                Order.order_data['buyer']['firstName'].as_string().ilike(search_term) |
+                # Поиск по фамилии покупателя  
+                Order.order_data['buyer']['lastName'].as_string().ilike(search_term) |
+                # Поиск по логину покупателя
+                Order.order_data['buyer']['login'].as_string().ilike(search_term) |
+                # Поиск по названию компании
+                Order.order_data['buyer']['companyName'].as_string().ilike(search_term)
+            )
             
-            # Конвертируем результаты
-            results = []
+            if need_flags_join:
+                # Строим запрос с JOIN по техническим флагам
+                query = select(Order).join(
+                    OrderTechnicalFlags,
+                    Order.allegro_order_id == OrderTechnicalFlags.allegro_order_id
+                ).where(
+                    search_conditions,
+                    Order.token_id == self.token_id,
+                    OrderTechnicalFlags.token_id == self.token_id
+                )
+                
+                # Применяем фильтры по техническим флагам
+                if stock_updated_filter is not None:
+                    query = query.where(OrderTechnicalFlags.is_stock_updated == stock_updated_filter)
+                    
+                if invoice_created_filter is not None:
+                    query = query.where(OrderTechnicalFlags.has_invoice_created == invoice_created_filter)
+                    
+                if invoice_id_filter:
+                    query = query.where(OrderTechnicalFlags.invoice_id == invoice_id_filter)
+                    
+            else:
+                # Строим базовый запрос без JOIN
+                query = select(Order).where(
+                    search_conditions,
+                    Order.token_id == self.token_id
+                )
+            
+            # Добавляем сортировку
+            query = query.order_by(Order.created_at.desc())
+            
+            # Для поиска применяем лимит сразу, без пагинации
+            orders = self.db.exec(query.limit(limit)).all()
+            
+            # Получаем технические флаги для найденных заказов
+            order_ids = [order.allegro_order_id for order in orders]
+            technical_flags = {}
+            if order_ids:
+                try:
+                    with OrderTechnicalFlagsService(self.user_id, self.token_id) as flags_service:
+                        technical_flags = flags_service.get_multiple_flags(order_ids)
+                        
+                        # Данные уже извлечены как обычные Python объекты
+                                
+                except Exception as e:
+                    logger.warning(f"Не удалось получить технические флаги для поиска: {e}")
+                    technical_flags = {}
+            
+            # Конвертируем результаты в стандартный формат
+            orders_data = []
             for order in orders:
-                buyer = order.buyer_data or {}
-                result = {
-                    "id": order.id,
-                    "order_id": order.order_id,
-                    "status": order.status,
-                    "buyer_email": buyer.get("email"),
-                    "buyer_name": f"{buyer.get('firstName', '')} {buyer.get('lastName', '')}".strip(),
-                    "total_amount": order.total_price_amount,
-                    "currency": order.total_price_currency,
-                    "created_at": order.created_at.isoformat() if order.created_at else None,
-                    "relevance_score": self._calculate_relevance(order, search_query)
-                }
-                results.append(result)
+                order_dict = self._format_order_data(order, technical_flags.get(order.allegro_order_id))
+                # Добавляем relevance score для поиска
+                order_dict["relevance_score"] = self._calculate_relevance(order, search_query)
+                orders_data.append(order_dict)
                 
             # Сортируем по релевантности
-            results.sort(key=lambda x: x["relevance_score"], reverse=True)
+            orders_data.sort(key=lambda x: x["relevance_score"], reverse=True)
             
             return {
                 "success": True,
-                "query": search_query,
-                "results": results,
-                "total_found": len(results)
+                "orders": orders_data,
+                "pagination": {
+                    "total": len(orders_data),
+                    "limit": limit,
+                    "offset": 0,
+                    "has_next": False,
+                    "has_prev": False
+                },
+                "filters": {
+                    "search_query": search_query,
+                    "search_type": "text_search",
+                    "stock_updated": stock_updated_filter,
+                    "invoice_created": invoice_created_filter,
+                    "invoice_id": invoice_id_filter
+                }
             }
             
         except Exception as e:
@@ -405,8 +558,15 @@ class OrderService:
             return {
                 "success": False,
                 "error": str(e),
-                "query": search_query,
-                "results": []
+                "orders": [],
+                "pagination": {"total": 0, "limit": limit, "offset": 0},
+                "filters": {
+                    "search_query": search_query, 
+                    "search_type": "text_search",
+                    "stock_updated": stock_updated_filter,
+                    "invoice_created": invoice_created_filter,
+                    "invoice_id": invoice_id_filter
+                }
             }
             
     def get_orders_statistics(self, days: int = 30) -> Dict[str, Any]:
@@ -548,27 +708,83 @@ class OrderService:
                 "history": []
             }
             
+    def _format_order_data(self, order: Order, technical_flags=None) -> Dict[str, Any]:
+        """
+        Форматирование данных заказа в единый формат для API.
+        Возвращает полные данные заказа из order_data + технические флаги.
+        
+        Args:
+            order: Объект заказа из БД
+            technical_flags: Технические флаги заказа (опционально)
+            
+        Returns:
+            Dict: Полные данные заказа с техническими флагами
+        """
+        # Формируем технические флаги с защитой от detached objects
+        technical_data = {
+            "is_stock_updated": False,
+            "has_invoice_created": False,
+            "invoice_id": None
+        }
+        
+        if technical_flags:
+            # Технические флаги уже в виде обычных Python данных
+            technical_data = {
+                "is_stock_updated": technical_flags.get("is_stock_updated", False),
+                "has_invoice_created": technical_flags.get("has_invoice_created", False),
+                "invoice_id": technical_flags.get("invoice_id")
+            }
+        
+        # Берем полные данные заказа из order_data JSON и добавляем метаданные
+        full_order_data = order.order_data.copy() if order.order_data else {}
+        
+        # Добавляем метаданные из БД
+        full_order_data.update({
+            "db_id": str(order.id),  # UUID из БД как строка
+            "token_id": str(order.token_id),
+            "allegro_order_id": order.allegro_order_id,
+            "db_created_at": order.created_at.isoformat() if order.created_at else None,
+            "db_updated_at": order.updated_at.isoformat() if order.updated_at else None,
+            "technical_flags": technical_data
+        })
+        
+        return full_order_data
+    
     def _calculate_relevance(self, order: Order, search_query: str) -> float:
-        """Расчет релевантности заказа для поискового запроса"""
+        """Расчет релевантности заказа для поискового запроса на основе JSON структуры"""
         
         relevance = 0.0
         query_lower = search_query.lower()
         
+        # Получаем данные из JSON структуры
+        order_data = order.order_data or {}
+        buyer_data = order_data.get("buyer", {})
+        
         # Точное совпадение ID заказа - максимальная релевантность
-        if order.order_id and query_lower in order.order_id.lower():
+        order_id = order_data.get("id", "")
+        if order_id and query_lower in order_id.lower():
             relevance += 10.0
             
         # Совпадения в данных покупателя
-        buyer = order.buyer_data or {}
-        
-        if buyer.get("email") and query_lower in buyer["email"].lower():
+        email = buyer_data.get("email", "")
+        if email and query_lower in email.lower():
             relevance += 5.0
             
-        if buyer.get("firstName") and query_lower in buyer["firstName"].lower():
+        first_name = buyer_data.get("firstName", "")
+        if first_name and query_lower in first_name.lower():
             relevance += 3.0
             
-        if buyer.get("lastName") and query_lower in buyer["lastName"].lower():
+        last_name = buyer_data.get("lastName", "")
+        if last_name and query_lower in last_name.lower():
             relevance += 3.0
+            
+        login = buyer_data.get("login", "")
+        if login and query_lower in login.lower():
+            relevance += 2.0
+            
+        company_name = buyer_data.get("companyName", "")
+        if company_name and query_lower in company_name.lower():
+            relevance += 2.0
             
         return relevance
         

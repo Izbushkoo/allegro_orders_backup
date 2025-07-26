@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.settings import settings
 from app.core.logging import get_logger
@@ -23,7 +23,7 @@ logger = get_logger(__name__)
 
 class CurrentUser(BaseModel):
     """Модель текущего пользователя из JWT токена"""
-    user_id: str
+    user_id: str = Field(description="То же самое что account_name")
     username: Optional[str] = None
     is_active: bool = True
     

@@ -42,7 +42,8 @@ COPY scripts/ ./scripts/
 
 # Create logs directory and set execute permissions on scripts
 RUN mkdir -p /app/logs && \
-    chmod +x scripts/*.py
+    chmod +x scripts/*.py && \
+    chmod +x scripts/entrypoint.sh
 
 # Install project in editable mode (quick since deps are already installed)
 RUN poetry config virtualenvs.create false \
@@ -55,4 +56,4 @@ EXPOSE 8000
 ENV PYTHONPATH=/app
 
 # Default command (can be overridden in docker-compose)
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"] 
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -8,7 +8,8 @@ from typing import List, Optional
 from uuid import UUID
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from requests.exceptions import HTTPError
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -28,6 +29,7 @@ router = APIRouter()
 
 class TokenCreate(BaseModel):
     """Модель для создания токена"""
+    account_name: str = Field(..., description="Название аккаунта Allegro")
     allegro_token: str = Field(..., description="Токен доступа Allegro")
     refresh_token: str = Field(..., description="Токен для обновления")
     expires_at: datetime = Field(..., description="Дата истечения токена")
@@ -36,6 +38,7 @@ class TokenResponse(BaseModel):
     """Модель ответа с токеном"""
     id: UUID
     user_id: str
+    account_name: str
     expires_at: datetime
     is_active: bool
     created_at: datetime
@@ -43,6 +46,7 @@ class TokenResponse(BaseModel):
 
 class TokenUpdate(BaseModel):
     """Модель для обновления токена"""
+    account_name: Optional[str] = Field(None, description="Новое название аккаунта")
     allegro_token: Optional[str] = Field(None, description="Новый токен доступа")
     refresh_token: Optional[str] = Field(None, description="Новый токен для обновления")
     expires_at: Optional[datetime] = Field(None, description="Новая дата истечения")
@@ -57,8 +61,8 @@ class TokenList(BaseModel):
 
 class AuthInitializeRequest(BaseModel):
     """Запрос на инициализацию авторизации"""
+    account_name: str = Field(..., description="Название аккаунта Allegro для идентификации")
     # user_id теперь берется из JWT токена
-    pass
 
 class AuthInitializeResponse(BaseModel):
     """Ответ с данными для авторизации"""
@@ -73,6 +77,7 @@ class AuthInitializeResponse(BaseModel):
 class AuthStatusRequest(BaseModel):
     """Запрос на проверку статуса авторизации"""
     device_code: str = Field(..., description="Код устройства")
+    account_name: str = Field(..., description="Название аккаунта Allegro")
 
 class AuthStatusResponse(BaseModel):
     """Ответ со статусом авторизации"""
@@ -109,6 +114,7 @@ async def create_token(
         token_service = TokenService(db_session)
         token = await token_service.create_token(
             user_id=current_user.user_id,
+            account_name=token_data.account_name,
             allegro_token=token_data.allegro_token,
             refresh_token=token_data.refresh_token,
             expires_at=token_data.expires_at
@@ -118,6 +124,7 @@ async def create_token(
         return TokenResponse(
             id=token.id,
             user_id=token.user_id,
+            account_name=token.account_name,
             expires_at=token.expires_at,
             is_active=token.is_active,
             created_at=token.created_at,
@@ -172,6 +179,7 @@ async def get_tokens(
             TokenResponse(
                 id=token.id,
                 user_id=token.user_id,
+                account_name=token.account_name,
                 expires_at=token.expires_at,
                 is_active=token.is_active,
                 created_at=token.created_at,
@@ -218,6 +226,7 @@ async def get_token(
         return TokenResponse(
             id=token.id,
             user_id=token.user_id,
+            account_name=token.account_name,
             expires_at=token.expires_at,
             is_active=token.is_active,
             created_at=token.created_at,
@@ -265,6 +274,7 @@ async def update_token(
         # Обновляем токен
         updated_token = await token_service.update_user_token(
             token_id=token_id,
+            account_name=token_update.account_name,
             allegro_token=token_update.allegro_token,
             refresh_token=token_update.refresh_token,
             expires_at=token_update.expires_at,
@@ -279,6 +289,7 @@ async def update_token(
         return TokenResponse(
             id=updated_token.id,
             user_id=updated_token.user_id,
+            account_name=updated_token.account_name,
             expires_at=updated_token.expires_at,
             is_active=updated_token.is_active,
             created_at=updated_token.created_at,
@@ -374,6 +385,7 @@ async def refresh_token(
         return TokenResponse(
             id=updated_token.id,
             user_id=updated_token.user_id,
+            account_name=updated_token.account_name,
             expires_at=updated_token.expires_at,
             is_active=updated_token.is_active,
             created_at=updated_token.created_at,
@@ -412,6 +424,7 @@ async def get_user_tokens(
             result.append(TokenResponse(
                 id=token.id,
                 user_id=token.user_id,
+                account_name=token.account_name,
                 expires_at=token.expires_at,
                 is_active=token.is_active,
                 created_at=token.created_at,
@@ -446,8 +459,8 @@ async def initialize_auth(
         auth_service = AllegroAuthService(db_session)
         
         # Инициализируем Device Code Flow
-        device_flow_data = await auth_service.initialize_device_flow(current_user.user_id)
-        
+        device_flow_data = await auth_service.initialize_device_flow(current_user.user_id, request.account_name)
+      
         # Запускаем задачу polling
         from datetime import timedelta
         expires_at = datetime.utcnow() + timedelta(seconds=device_flow_data["expires_in"])
@@ -455,6 +468,7 @@ async def initialize_auth(
         task = poll_authorization_status.delay(
             device_code=device_flow_data["device_code"],
             user_id=current_user.user_id,
+            account_name=request.account_name,
             expires_at_iso=expires_at.isoformat(),
             interval_seconds=device_flow_data["interval"]
         )
@@ -470,10 +484,19 @@ async def initialize_auth(
             interval=device_flow_data["interval"],
             task_id=task.id
         )
-        
+    except HTTPError as http_err:
+        # HTTPError.response — это объект requests.Response
+        resp = http_err.response
+        # пробуем вычитать JSON, иначе — текст
+        try:
+            detail = resp.json()
+        except ValueError:
+            detail = resp.text or resp.reason
+        # пробрасываем код и тело из микросервиса
+        raise HTTPException(status_code=resp.status_code, detail=detail)
     except Exception as e:
         logger.error(f"Ошибка при инициализации авторизации: {e}")
-        raise InternalServerErrorHTTPException(detail="Failed to initialize authorization")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/auth/status", response_model=AuthStatusResponse, summary="Проверка статуса авторизации")
@@ -495,7 +518,8 @@ async def check_auth_status(
         auth_service = AllegroAuthService(db_session)
         status_data = await auth_service.check_auth_status(
             device_code=request.device_code,
-            user_id=current_user.user_id
+            user_id=current_user.user_id,
+            account_name=request.account_name
         )
         
         return AuthStatusResponse(
@@ -544,6 +568,7 @@ async def validate_and_refresh_token(
         return TokenResponse(
             id=validated_token.id,
             user_id=validated_token.user_id,
+            account_name=validated_token.account_name,
             expires_at=validated_token.expires_at,
             is_active=validated_token.is_active,
             created_at=validated_token.created_at,

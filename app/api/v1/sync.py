@@ -119,6 +119,18 @@ class ActivateSyncRequest(BaseModel):
 class DeactivateSyncRequest(BaseModel):
     token_id: UUID
 
+class TokenSyncStatusResponse(BaseModel):
+    """Статус автосинхронизации для конкретного токена"""
+    token_id: str
+    is_active: bool
+    interval_minutes: Optional[int]
+    status: Optional[str]
+    task_name: Optional[str]
+    last_run_at: Optional[datetime]
+    last_success_at: Optional[datetime]
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+
 # API Endpoints
 
 @router.post("/start", response_model=Dict[str, Any], summary="Запустить синхронизацию")
@@ -218,73 +230,6 @@ async def get_sync_history(
         logger.error(f"Ошибка получения истории синхронизации: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка получения истории: {str(e)}")
 
-
-@router.get("/status/{sync_id}", response_model=SyncResponse, summary="Статус синхронизации")
-async def get_sync_status(
-    sync_id: UUID,
-    current_user: CurrentUser = CurrentUserDep
-):
-    """
-    Получить статус конкретной синхронизации.
-    
-    **Требует аутентификации через JWT токен.**
-    **Пользователь может получить статус только своих синхронизаций.**
-    """
-    try:
-        logger.info(f"Получение статуса синхронизации {sync_id} для пользователя {current_user.user_id}")
-        
-        db_session = get_sync_db_session_direct()
-        sync_service = OrderSyncService(db_session)
-        
-        sync_status = sync_service.get_sync_status(
-            sync_id=sync_id,
-            user_id=current_user.user_id
-        )
-        
-        if not sync_status:
-            raise HTTPException(status_code=404, detail="Синхронизация не найдена")
-            
-        return sync_status
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Ошибка получения статуса синхронизации: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка получения статуса: {str(e)}")
-
-
-@router.post("/cancel/{sync_id}", summary="Отменить синхронизацию")
-async def cancel_sync(
-    sync_id: UUID,
-    current_user: CurrentUser = CurrentUserDep
-):
-    """
-    Отменить выполняющуюся синхронизацию.
-    
-    **Требует аутентификации через JWT токен.**
-    **Пользователь может отменить только свои синхронизации.**
-    """
-    try:
-        logger.info(f"Отмена синхронизации {sync_id} для пользователя {current_user.user_id}")
-        
-        db_session = get_sync_db_session_direct()
-        sync_service = OrderSyncService(db_session)
-        
-        result = sync_service.cancel_sync(
-            sync_id=sync_id,
-            user_id=current_user.user_id
-        )
-        
-        if not result["success"]:
-            raise HTTPException(status_code=400, detail=result["message"])
-            
-        return {"message": result["message"], "cancelled": True}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Ошибка отмены синхронизации: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка отмены синхронизации: {str(e)}")
 
 
 @router.get("/stats", response_model=SyncStats, summary="Статистика синхронизаций")
@@ -554,4 +499,67 @@ async def get_active_syncs(
             "updated_at": s.updated_at
         }
         for s in active
-    ] 
+    ]
+
+@router.get("/status/{token_id}", response_model=TokenSyncStatusResponse, summary="Статус автосинхронизации для конкретного токена")
+async def get_sync_status_for_token(
+    token_id: UUID,
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Получить статус автосинхронизации для конкретного токена.
+    Возвращает информацию о том, активна ли автосинхронизация для данного токена.
+    """
+    try:
+        logger.info(f"Получение статуса автосинхронизации для токена {token_id} пользователя {current_user.user_id}")
+        
+        db = get_sync_db_session_direct()
+        schedule_service = ActiveSyncScheduleService(db)
+        
+        # Проверяем, принадлежит ли токен пользователю
+        from app.services.allegro_auth_service import AllegroAuthService
+        auth_service = AllegroAuthService(None)
+        token_record = auth_service.get_token_by_id_sync(str(token_id), current_user.user_id)
+        
+        if not token_record:
+            db.close()
+            raise HTTPException(status_code=404, detail="Токен не найден или не принадлежит пользователю")
+        
+        # Получаем статус автосинхронизации
+        schedule = schedule_service.get_by_token(current_user.user_id, str(token_id))
+        
+        if schedule:
+            # Автосинхронизация активна
+            result = {
+                "token_id": str(token_id),
+                "is_active": True,
+                "interval_minutes": schedule.interval_minutes,
+                "status": schedule.status,
+                "task_name": schedule.task_name,
+                "last_run_at": schedule.last_run_at,
+                "last_success_at": schedule.last_success_at,
+                "created_at": schedule.created_at,
+                "updated_at": schedule.updated_at
+            }
+        else:
+            # Автосинхронизация не активна
+            result = {
+                "token_id": str(token_id),
+                "is_active": False,
+                "interval_minutes": None,
+                "status": None,
+                "task_name": None,
+                "last_run_at": None,
+                "last_success_at": None,
+                "created_at": None,
+                "updated_at": None
+            }
+        
+        db.close()
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка получения статуса автосинхронизации для токена: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка получения статуса: {str(e)}") 

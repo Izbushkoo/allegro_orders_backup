@@ -24,46 +24,7 @@ router = APIRouter()
 
 # Модели данных
 
-class OrderSummary(BaseModel):
-    """Краткая информация о заказе"""
-    id: int
-    order_id: str
-    status: str
-    buyer_email: Optional[str] = None
-    buyer_name: Optional[str] = None
-    total_amount: Optional[float] = None
-    currency: Optional[str] = None
-    line_items_count: int = 0
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-    allegro_revision: Optional[str] = None
-
-class OrderDetails(BaseModel):
-    """Детальная информация о заказе"""
-    id: int
-    order_id: str
-    status: str
-    buyer_data: Optional[Dict[str, Any]] = None
-    line_items: Optional[List[Dict[str, Any]]] = None
-    delivery_data: Optional[Dict[str, Any]] = None
-    payment_data: Optional[Dict[str, Any]] = None
-    total_price_amount: Optional[float] = None
-    total_price_currency: Optional[str] = None
-    allegro_revision: Optional[str] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-
-class OrdersList(BaseModel):
-    """Список заказов с пагинацией"""
-    orders: List[OrderSummary]
-    pagination: Dict[str, Any]
-    filters: Dict[str, Any]
-
-class SearchResults(BaseModel):
-    """Результаты поиска заказов"""
-    query: str
-    results: List[Dict[str, Any]]
-    total_found: int
+# Модели данных удалены - теперь возвращаем полные данные как Dict[str, Any]
 
 class OrderStatistics(BaseModel):
     """Статистика заказов"""
@@ -132,7 +93,7 @@ def validate_token_and_get_service(token_id: UUID, current_user: CurrentUser) ->
 # API Endpoints
 
 @router.get("/", 
-          response_model=OrdersList, 
+          response_model=Dict[str, Any], 
           summary="Получить список заказов",
           description="Получение списка заказов с фильтрацией и пагинацией")
 async def get_orders(
@@ -142,10 +103,18 @@ async def get_orders(
     status: Optional[str] = Query(None, description="Фильтр по статусу заказа"),
     from_date: Optional[datetime] = Query(None, description="Заказы от указанной даты"),
     to_date: Optional[datetime] = Query(None, description="Заказы до указанной даты"),
+    stock_updated: Optional[bool] = Query(None, description="Фильтр по флагу обновления стока"),
+    invoice_created: Optional[bool] = Query(None, description="Фильтр по флагу создания инвойса"),
+    invoice_id: Optional[str] = Query(None, description="Фильтр по конкретному ID инвойса"),
     current_user: CurrentUser = CurrentUserDep
 ):
     """
     Получить список заказов текущего пользователя с фильтрацией и пагинацией.
+    
+    **Фильтрация поддерживается по:**
+    - Статусу заказа
+    - Диапазону дат
+    - Техническим флагам (статус обновления стока, создания инвойсов)
     
     **Требует аутентификации через JWT токен.**
     """
@@ -157,7 +126,10 @@ async def get_orders(
             offset=offset,
             status_filter=status,
             from_date=from_date,
-            to_date=to_date
+            to_date=to_date,
+            stock_updated_filter=stock_updated,
+            invoice_created_filter=invoice_created,
+            invoice_id_filter=invoice_id
         )
         
         return result
@@ -167,17 +139,32 @@ async def get_orders(
 
 
 @router.get("/search",
-          response_model=SearchResults,
+          response_model=Dict[str, Any],
           summary="Поиск заказов",
-          description="Поиск заказов по email покупателя, ID заказа или имени")
+          description="Поиск заказов по email покупателя, ID заказа или имени с дополнительной фильтрацией")
 async def search_orders(
     token_id: UUID = Query(..., description="ID токена для доступа к Allegro API"),
     query: str = Query(..., min_length=3, description="Поисковый запрос (минимум 3 символа)"),
-    limit: int = Query(50, ge=1, le=100, description="Максимальное количество результатов"),
+    limit: int = Query(50, ge=1, le=1000, description="Максимальное количество результатов"),
+    stock_updated: Optional[bool] = Query(None, description="Фильтр по флагу обновления стока"),
+    invoice_created: Optional[bool] = Query(None, description="Фильтр по флагу создания инвойса"),
+    invoice_id: Optional[str] = Query(None, description="Фильтр по конкретному ID инвойса"),
     current_user: CurrentUser = CurrentUserDep
 ):
     """
     Поиск заказов текущего пользователя по различным критериям.
+    
+    **Поддерживается поиск по:**
+    - Email покупателя
+    - ID заказа в Allegro
+    - Имени и фамилии покупателя
+    - Логину покупателя
+    - Названию компании
+    
+    **Дополнительная фильтрация по техническим флагам:**
+    - Статус обновления стока
+    - Статус создания инвойсов
+    - Конкретный ID инвойса
     
     **Требует аутентификации через JWT токен.**
     """
@@ -186,7 +173,10 @@ async def search_orders(
         
         result = order_service.search_orders(
             search_query=query,
-            limit=limit
+            limit=limit,
+            stock_updated_filter=stock_updated,
+            invoice_created_filter=invoice_created,
+            invoice_id_filter=invoice_id
         )
         
         return result
@@ -419,3 +409,216 @@ async def get_orders_health(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка проверки состояния: {str(e)}") 
+
+
+@router.patch("/{order_id}/stock-status",
+            response_model=Dict[str, Any],
+            summary="Обновить статус списания стока",
+            description="Обновление флага списания стока для заказа")
+async def update_stock_status(
+    stock_update: Dict[str, bool],  # {"is_stock_updated": true/false}
+    token_id: UUID = Query(..., description="ID токена для доступа к Allegro API"),
+    order_id: str = Path(..., description="ID заказа в Allegro"),
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Обновить статус списания стока для заказа.
+    
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может обновлять только свои заказы.**
+    """
+    try:
+        # Импортируем сервис здесь для избежания циклических импортов
+        from app.services.order_technical_flags_service import OrderTechnicalFlagsService
+        
+        # Валидируем принадлежность токена пользователю
+        validate_token_and_get_service(token_id, current_user)
+        
+        # Валидируем входные данные
+        if "is_stock_updated" not in stock_update:
+            raise HTTPException(
+                status_code=422, 
+                detail="Поле 'is_stock_updated' обязательно"
+            )
+        
+        is_stock_updated = stock_update["is_stock_updated"]
+        if not isinstance(is_stock_updated, bool):
+            raise HTTPException(
+                status_code=422,
+                detail="Поле 'is_stock_updated' должно быть булевым значением"
+            )
+        
+        # Обновляем флаг стока
+        with OrderTechnicalFlagsService(current_user.user_id, token_id) as flags_service:
+            updated_flags = flags_service.update_stock_status(order_id, is_stock_updated)
+            
+            return {
+                "success": True,
+                "order_id": order_id,
+                "is_stock_updated": updated_flags.is_stock_updated,
+                "updated_at": updated_flags.updated_at.isoformat(),
+                "message": f"Статус списания стока обновлен на {is_stock_updated}"
+            }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Ошибка обновления статуса стока: {str(e)}"
+        )
+
+
+@router.patch("/{order_id}/invoice-status",
+            response_model=Dict[str, Any],
+            summary="Обновить статус создания инвойса",
+            description="Обновление флагов создания инвойса для заказа")
+async def update_invoice_status(
+    invoice_update: Dict[str, Any],  # {"has_invoice_created": true, "invoice_id": "INV-123"}
+    token_id: UUID = Query(..., description="ID токена для доступа к Allegro API"),
+    order_id: str = Path(..., description="ID заказа в Allegro"),
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Обновить статус создания инвойса для заказа.
+    
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может обновлять только свои заказы.**
+    """
+    try:
+        # Импортируем сервис здесь для избежания циклических импортов
+        from app.services.order_technical_flags_service import OrderTechnicalFlagsService
+        
+        # Валидируем принадлежность токена пользователю
+        validate_token_and_get_service(token_id, current_user)
+        
+        # Валидируем входные данные
+        if "has_invoice_created" not in invoice_update:
+            raise HTTPException(
+                status_code=422, 
+                detail="Поле 'has_invoice_created' обязательно"
+            )
+        
+        has_invoice_created = invoice_update["has_invoice_created"]
+        if not isinstance(has_invoice_created, bool):
+            raise HTTPException(
+                status_code=422,
+                detail="Поле 'has_invoice_created' должно быть булевым значением"
+            )
+        
+        invoice_id = invoice_update.get("invoice_id")
+        if invoice_id is not None and not isinstance(invoice_id, str):
+            raise HTTPException(
+                status_code=422,
+                detail="Поле 'invoice_id' должно быть строкой или null"
+            )
+        
+        # Обновляем флаги инвойса
+        with OrderTechnicalFlagsService(current_user.user_id, token_id) as flags_service:
+            updated_flags = flags_service.update_invoice_status(
+                order_id, 
+                has_invoice_created, 
+                invoice_id
+            )
+            
+            return {
+                "success": True,
+                "order_id": order_id,
+                "has_invoice_created": updated_flags.has_invoice_created,
+                "invoice_id": updated_flags.invoice_id,
+                "updated_at": updated_flags.updated_at.isoformat(),
+                "message": f"Статус инвойса обновлен: created={has_invoice_created}, id={invoice_id}"
+            }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Ошибка обновления статуса инвойса: {str(e)}"
+        )
+
+
+@router.get("/{order_id}/technical-flags",
+          response_model=Dict[str, Any],
+          summary="Получить технические флаги заказа",
+          description="Получение текущих технических флагов заказа")
+async def get_order_technical_flags(
+    token_id: UUID = Query(..., description="ID токена для доступа к Allegro API"),
+    order_id: str = Path(..., description="ID заказа в Allegro"),
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Получить технические флаги заказа (сток, инвойс).
+    
+    **Требует аутентификации через JWT токен.**
+    **Пользователь может получать только свои заказы.**
+    """
+    try:
+        # Импортируем сервис здесь для избежания циклических импортов
+        from app.services.order_technical_flags_service import OrderTechnicalFlagsService
+        
+        # Валидируем принадлежность токена пользователю
+        validate_token_and_get_service(token_id, current_user)
+        
+        # Получаем технические флаги (с автосозданием при необходимости)
+        with OrderTechnicalFlagsService(current_user.user_id, token_id) as flags_service:
+            flags = flags_service.get_or_create_flags(order_id)
+            
+            return {
+                "order_id": order_id,
+                "technical_flags": {
+                    "is_stock_updated": flags.is_stock_updated,
+                    "has_invoice_created": flags.has_invoice_created,
+                    "invoice_id": flags.invoice_id,
+                    "created_at": flags.created_at.isoformat(),
+                    "updated_at": flags.updated_at.isoformat()
+                }
+            }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Ошибка получения технических флагов: {str(e)}"
+        )
+
+
+@router.get("/technical-flags/summary",
+          response_model=Dict[str, Any],
+          summary="Сводка по техническим флагам",
+          description="Получение статистики по техническим флагам всех заказов токена")
+async def get_technical_flags_summary(
+    token_id: UUID = Query(..., description="ID токена для доступа к Allegro API"),
+    current_user: CurrentUser = CurrentUserDep
+):
+    """
+    Получить сводную статистику по техническим флагам всех заказов токена.
+    
+    **Требует аутентификации через JWT токен.**
+    """
+    try:
+        # Импортируем сервис здесь для избежания циклических импортов
+        from app.services.order_technical_flags_service import OrderTechnicalFlagsService
+        
+        # Валидируем принадлежность токена пользователю
+        validate_token_and_get_service(token_id, current_user)
+        
+        # Получаем сводку флагов
+        with OrderTechnicalFlagsService(current_user.user_id, token_id) as flags_service:
+            summary = flags_service.get_flags_summary()
+            
+            return {
+                "token_id": str(token_id),
+                "summary": summary,
+                "generated_at": datetime.utcnow().isoformat()
+            }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Ошибка получения сводки флагов: {str(e)}"
+        ) 

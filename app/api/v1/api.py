@@ -6,7 +6,7 @@
 
 from fastapi import APIRouter
 
-from app.api.v1 import tokens, orders, sync
+from app.api.v1 import tokens, orders, sync, offers
 
 # Основной роутер для API v1
 api_router = APIRouter()
@@ -28,4 +28,10 @@ api_router.include_router(
     sync.router,
     prefix="/sync",
     tags=["sync"],
-) 
+)
+
+api_router.include_router(
+    offers.router,
+    prefix="/offers",
+    tags=["offers"],
+)

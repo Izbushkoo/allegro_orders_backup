@@ -1,4 +1,4 @@
-"""add activ task schedules
+"""add active task schedules
 
 Revision ID: dc671ff6cbd7
 Revises: 74c7a32dc927

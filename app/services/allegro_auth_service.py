@@ -31,12 +31,13 @@ class AllegroAuthService:
         self.token_url = f"{self.allegro_settings.auth_url}/token"
         self.api_url = self.allegro_settings.api_url
     
-    async def initialize_device_flow(self, user_id: str) -> Dict[str, Any]:
+    async def initialize_device_flow(self, user_id: str, account_name: str) -> Dict[str, Any]:
         """
         Инициализирует процесс Device Code Flow авторизации для Allegro.
         
         Args:
             user_id: ID пользователя для которого создается токен
+            account_name: Название аккаунта Allegro
         
         Returns:
             Dict с данными авторизации (device_code, user_code, verification_uri, etc.)
@@ -44,10 +45,14 @@ class AllegroAuthService:
         Raises:
             ValidationError: Если не удалось инициализировать авторизацию
         """
-        logger.debug(f"[DEBUG] initialize_device_flow called with user_id: {user_id}")
+        logger.debug(f"[DEBUG] initialize_device_flow called with user_id: {user_id}, account_name: {account_name}")
         
         try:
-            logger.info(f"Initializing Device Code Flow for user: {user_id}")
+            # Проверяем уникальность account_name для пользователя
+            if not await self.token_service.validate_account_name_uniqueness(user_id, account_name):
+                raise ValidationError(f"Аккаунт '{account_name}' уже существует для пользователя '{user_id}'")
+            
+            logger.info(f"Initializing Device Code Flow for user: {user_id}, account: {account_name}")
             
             logger.debug(f"[DEBUG] Creating authorization header")
             auth_str = f'{self.allegro_settings.client_id}:{self.allegro_settings.client_secret}'
@@ -80,6 +85,7 @@ class AllegroAuthService:
                     
                     # Добавляем дополнительные поля для удобства
                     auth_data["user_id"] = user_id
+                    auth_data["account_name"] = account_name
                     
                     # Добавляем время истечения в ISO формате для Celery
                     expires_at = datetime.utcnow() + timedelta(seconds=auth_data.get("expires_in", 600))
@@ -98,22 +104,27 @@ class AllegroAuthService:
             logger.error(f"Network error during Device Code Flow initialization: {str(e)}")
             logger.debug(f"[DEBUG] RequestError: {type(e)} - {str(e)}")
             raise ValidationError(f"Network error: {str(e)}")
+        except ValidationError as e:
+            logger.error(f"Validation error during Device Code Flow initialization: {str(e)}")
+            logger.debug(f"[DEBUG] ValidationError: {type(e)} - {str(e)}")
+            raise ValidationError(f"Validation error: {str(e)}")
         except Exception as e:
             logger.error(f"Unexpected error during Device Code Flow initialization: {str(e)}")
             logger.debug(f"[DEBUG] Exception type: {type(e)}, details: {str(e)}", exc_info=True)
             raise InternalServerErrorHTTPException("Failed to initialize authorization")
     
-    async def check_auth_status(self, device_code: str, user_id: str) -> Dict[str, str]:
+    async def check_auth_status(self, device_code: str, user_id: str, account_name: str) -> Dict[str, str]:
         """
         Проверяет статус авторизации для данного device_code.
         
         Args:
             device_code: Код устройства, полученный от initialize_device_flow
             user_id: ID пользователя для которого проверяется авторизация
-        
+            account_name: Название аккаунта Allegro
+            
         Returns:
             Dict со статусом: {'status': 'pending'|'completed'|'failed'}
-        
+            
         Raises:
             ValidationError: Если произошла ошибка при проверке
         """
@@ -186,6 +197,7 @@ class AllegroAuthService:
                     
                     await self.token_service.create_token(
                         user_id=user_id,
+                        account_name=account_name,
                         allegro_token=token_data["access_token"],
                         refresh_token=token_data["refresh_token"],
                         expires_at=expires_at
@@ -429,12 +441,13 @@ class AllegroAuthService:
             logger.error(f"[SYNC] Unexpected error during Device Code Flow initialization: {str(e)}")
             raise InternalServerErrorHTTPException("Failed to initialize authorization")
 
-    def check_auth_status_sync(self, device_code: str, user_id: str) -> Dict[str, str]:
+    def check_auth_status_sync(self, device_code: str, user_id: str, account_name: str) -> Dict[str, str]:
         """
         Синхронная проверка статуса авторизации для данного device_code.
         Args:
             device_code: Код устройства, полученный от initialize_device_flow
             user_id: ID пользователя для которого проверяется авторизация
+            account_name: Название аккаунта Allegro
         Returns:
             Dict со статусом: {'status': 'pending'|'completed'|'failed'}
         Raises:
@@ -484,6 +497,7 @@ class AllegroAuthService:
                 expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
                 self.token_service.create_token_sync(
                     user_id=user_id,
+                    account_name=account_name,
                     allegro_token=token_data["access_token"],
                     refresh_token=token_data["refresh_token"],
                     expires_at=expires_at

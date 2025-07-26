@@ -32,6 +32,15 @@ from .sync_history import (
     SyncStatus,
     SyncStatistics
 )
+from .order_technical_flags import (
+    OrderTechnicalFlags,
+    OrderTechnicalFlagsCreate,
+    OrderTechnicalFlagsRead,
+    OrderTechnicalFlagsUpdate,
+    StockStatusUpdate,
+    InvoiceStatusUpdate,
+    OrderWithTechnicalFlags
+)
 
 __all__ = [
     "BaseModel",
@@ -54,4 +63,11 @@ __all__ = [
     "SyncHistoryUpdate",
     "SyncStatus",
     "SyncStatistics",
+    "OrderTechnicalFlags",
+    "OrderTechnicalFlagsCreate",
+    "OrderTechnicalFlagsRead",
+    "OrderTechnicalFlagsUpdate",
+    "StockStatusUpdate",
+    "InvoiceStatusUpdate",
+    "OrderWithTechnicalFlags",
 ] 

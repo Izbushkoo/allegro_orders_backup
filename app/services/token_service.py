@@ -25,9 +25,37 @@ class TokenService:
     def __init__(self, db_session: AsyncSession):
         self.db_session = db_session
     
+    async def validate_account_name_uniqueness(self, user_id: str, account_name: str) -> bool:
+        """
+        Проверить уникальность комбинации user_id + account_name.
+        
+        Args:
+            user_id: ID пользователя
+            account_name: Название аккаунта
+            
+        Returns:
+            bool: True если комбинация уникальна, False если уже существует
+        """
+        try:
+            query = select(UserToken).where(
+                and_(
+                    UserToken.user_id == user_id,
+                    UserToken.account_name == account_name
+                )
+            )
+            result = await self.db_session.exec(query)
+            existing_token = result.first()
+            
+            return existing_token is None
+            
+        except Exception as e:
+            logger.error(f"Failed to validate account name uniqueness: {str(e)}")
+            return False
+    
     async def create_token(
         self,
         user_id: str,
+        account_name: str,
         allegro_token: str,
         refresh_token: str,
         expires_at: datetime
@@ -37,6 +65,7 @@ class TokenService:
         
         Args:
             user_id: ID пользователя
+            account_name: Название аккаунта Allegro
             allegro_token: Токен доступа Allegro
             refresh_token: Refresh токен
             expires_at: Дата истечения токена
@@ -45,13 +74,18 @@ class TokenService:
             UserToken: Созданный токен
             
         Raises:
-            ValidationError: Если данные невалидны
+            ValidationError: Если данные невалидны или комбинация user_id + account_name не уникальна
         """
         try:
-            # Деактивируем старые токены пользователя
+            # Проверяем уникальность комбинации user_id + account_name
+            if not await self.validate_account_name_uniqueness(user_id, account_name):
+                raise ValidationError(f"Аккаунт '{account_name}' уже существует для пользователя '{user_id}'")
+            
+            # Деактивируем старые токены пользователя для этого аккаунта
             old_tokens_query = select(UserToken).where(
                 and_(
                     UserToken.user_id == user_id,
+                    UserToken.account_name == account_name,
                     UserToken.is_active == True
                 )
             )
@@ -64,6 +98,7 @@ class TokenService:
             # Создаем новый токен
             token = UserToken(
                 user_id=user_id,
+                account_name=account_name,
                 allegro_token=allegro_token,
                 refresh_token=refresh_token,
                 expires_at=expires_at,
@@ -242,7 +277,7 @@ class TokenService:
                 WHERE id = :token_id
             """
             
-            await self.db_session.exec(text(sql), values)
+            await self.db_session.exec(text(sql).bindparams(**values))
             await self.db_session.commit()
             
             # Возвращаем обновленный токен
@@ -277,8 +312,10 @@ class TokenService:
             """
             
             result = await self.db_session.exec(
-                text(sql), 
-                {"token_id": token_id, "updated_at": datetime.utcnow()}
+                text(sql).bindparams(
+                    token_id=token_id, 
+                    updated_at=datetime.utcnow()
+                )
             )
             await self.db_session.commit()
             
@@ -365,6 +402,7 @@ class TokenService:
     async def update_user_token(
         self,
         token_id: UUID,
+        account_name: Optional[str] = None,
         allegro_token: Optional[str] = None,
         refresh_token: Optional[str] = None,
         expires_at: Optional[datetime] = None,
@@ -375,6 +413,7 @@ class TokenService:
         
         Args:
             token_id: ID токена
+            account_name: Новое название аккаунта (опционально)
             allegro_token: Новый access token (опционально)
             refresh_token: Новый refresh token (опционально)
             expires_at: Новая дата истечения (опционально)
@@ -385,6 +424,8 @@ class TokenService:
         """
         try:
             update_data = {}
+            if account_name is not None:
+                update_data["account_name"] = account_name
             if allegro_token is not None:
                 update_data["allegro_token"] = allegro_token
             if refresh_token is not None:
@@ -467,11 +508,12 @@ class TokenService:
             logger.error(f"Failed to validate token {token_id}: {str(e)}")
             return None 
 
-    def create_token_sync(self, user_id: str, allegro_token: str, refresh_token: str, expires_at) -> 'UserToken':
+    def create_token_sync(self, user_id: str, account_name: str, allegro_token: str, refresh_token: str, expires_at) -> 'UserToken':
         """
         Синхронное создание токена пользователя.
         Args:
             user_id: ID пользователя
+            account_name: Название аккаунта Allegro
             allegro_token: Access token
             refresh_token: Refresh token
             expires_at: Время истечения (datetime)
@@ -485,6 +527,7 @@ class TokenService:
         token = UserToken(
             id=uuid.uuid4(),
             user_id=user_id,
+            account_name=account_name,
             allegro_token=allegro_token,
             refresh_token=refresh_token,
             expires_at=expires_at,
