@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from sqlmodel import SQLModel, Field, UniqueConstraint
+from sqlmodel import SQLModel, Field, Index
 
 from .base import BaseModel
 
@@ -44,9 +44,14 @@ class UserToken(BaseModel, table=True):
         description="Активен ли токен"
     )
     
-    # Уникальное ограничение на пару user_id + account_name
+    # Частичный уникальный индекс: уникальность только для активных токенов
     __table_args__ = (
-        UniqueConstraint('user_id', 'account_name', name='unique_user_account'),
+        Index(
+            'unique_active_user_account',
+            'user_id', 'account_name',
+            unique=True,
+            postgresql_where=('is_active = true')
+        ),
     )
 
 

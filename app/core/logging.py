@@ -15,9 +15,10 @@ from typing import Any, Dict
 from .settings import settings
 
 
-def disable_sqlalchemy_logging():
-    """Принудительно отключает все SQLAlchemy логи"""
-    sqlalchemy_loggers = [
+def disable_technical_logging():
+    """Принудительно отключает все технические логи от внешних библиотек"""
+    technical_loggers = [
+        # SQLAlchemy
         "sqlalchemy",
         "sqlalchemy.engine",
         "sqlalchemy.engine.Engine", 
@@ -26,9 +27,42 @@ def disable_sqlalchemy_logging():
         "sqlalchemy.pool",
         "sqlalchemy.dialects",
         "sqlalchemy.orm",
+        # HTTP клиенты
+        "httpx",
+        "httpcore",
+        "httpcore.connection",
+        "httpcore.http11",
+        "httpcore.http2",
+        "urllib3",
+        "urllib3.connectionpool",
+        "urllib3.util.retry",
+        "requests",
+        "requests.packages.urllib3",
+        # Celery технические логи
+        "celery.worker.strategy",
+        "celery.worker.consumer",
+        "celery.worker.heartbeat",
+        "celery.beat",
+        # FastAPI/Uvicorn технические
+        "uvicorn.access",
+        "uvicorn.error",
+        "uvicorn.asgi",
+        # Redis
+        "redis.connection",
+        "redis.client",
+        # Alembic
+        "alembic.runtime.migration",
+        "alembic.env",
+        # Asyncio
+        "asyncio",
+        "asyncio.selector_events",
+        "asyncio.base_events",
+        # Другие технические
+        "multipart",
+        "charset_normalizer",
     ]
     
-    for logger_name in sqlalchemy_loggers:
+    for logger_name in technical_loggers:
         logger = logging.getLogger(logger_name)
         logger.setLevel(logging.CRITICAL + 1)  # Выше CRITICAL
         logger.disabled = True  # Полностью отключаем логгер
@@ -142,8 +176,8 @@ class JSONFormatter(logging.Formatter):
 def setup_logging() -> None:
     """Настройка системы логирования"""
     
-    # Отключаем SQLAlchemy логи в самом начале
-    disable_sqlalchemy_logging()
+    # Отключаем все технические логи в самом начале
+    disable_technical_logging()
     
     # Создаем директорию для логов
     log_path = Path(settings.logging.file_path)
@@ -187,37 +221,24 @@ def setup_logging() -> None:
         console_handler.addFilter(sqlalchemy_filter)  # Добавляем фильтр
         logger.addHandler(console_handler)
     
-    # Настройка уровней для внешних библиотек
-    # SQLAlchemy уже отключен выше
-    
-    # Celery - только важные сообщения
+    # Настройка уровней для оставшихся библиотек (технические уже отключены выше)
+    # Celery - только важные сообщения от основных компонентов
     logging.getLogger("celery").setLevel(logging.WARNING)
     logging.getLogger("celery.worker").setLevel(logging.INFO)
     logging.getLogger("celery.task").setLevel(logging.INFO)
-    logging.getLogger("celery.worker.strategy").setLevel(logging.WARNING)
     
-    # FastAPI и Uvicorn
+    # FastAPI и Uvicorn - основные компоненты
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("fastapi").setLevel(logging.WARNING)
     
-    # HTTP клиенты
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("requests").setLevel(logging.WARNING)
-    
-    # Redis
-    logging.getLogger("redis").setLevel(logging.WARNING)
-    
-    # Alembic
+    # Alembic - основные сообщения
     logging.getLogger("alembic").setLevel(logging.WARNING)
     
-    # Другие библиотеки
-    logging.getLogger("asyncio").setLevel(logging.WARNING)
+    # Другие основные библиотеки
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     
-    # Еще раз отключаем SQLAlchemy логи для гарантии
-    disable_sqlalchemy_logging()
+    # Еще раз отключаем технические логи для гарантии
+    disable_technical_logging()
     
     logger.info("Logging system initialized", extra={
         "extra_data": {

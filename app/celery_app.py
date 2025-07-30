@@ -9,10 +9,10 @@ from celery.schedules import crontab
 import pytz
 
 from app.core.settings import settings
-from app.core.logging import setup_logging, get_logger, disable_sqlalchemy_logging
+from app.core.logging import setup_logging, get_logger, disable_technical_logging
 
-# Сначала отключаем SQLAlchemy логи
-disable_sqlalchemy_logging()
+# Сначала отключаем все технические логи
+disable_technical_logging()
 
 # Инициализация логирования
 setup_logging()

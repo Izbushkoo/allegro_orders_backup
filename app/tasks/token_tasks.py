@@ -181,7 +181,7 @@ def refresh_all_tokens(self):
     errors = []
     auth_service = AllegroAuthService(sync_session)
     try:
-        tokens = sync_session.query(UserToken).all()
+        tokens = sync_session.exec(select(UserToken).where(UserToken.is_active == True)).all()
         for token in tokens:
             try:
                 auth_service.refresh_token_sync(token)

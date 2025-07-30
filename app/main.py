@@ -10,13 +10,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.settings import settings
-from app.core.logging import setup_logging, get_logger, disable_sqlalchemy_logging
+from app.core.logging import setup_logging, get_logger, disable_technical_logging
 from app.core.database import db_manager
 from app.core.auth import CurrentUser
 from app.api.dependencies import CurrentUserDep
 
-# Сначала отключаем SQLAlchemy логи
-disable_sqlalchemy_logging()
+# Сначала отключаем все технические логи
+disable_technical_logging()
 
 # Инициализация логирования в самом начале
 setup_logging()
