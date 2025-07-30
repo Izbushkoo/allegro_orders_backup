@@ -63,7 +63,6 @@ class DataMonitoringService:
         sync_events = self.db.exec(
             select(OrderEvent)
             .where(OrderEvent.occurred_at >= cutoff_time)
-            .where(OrderEvent.event_type == "ORDER_SYNC")
         ).all()
         
         # Анализируем качество данных
@@ -421,35 +420,66 @@ class DataMonitoringService:
         total_events = len(order_events)
         events_with_missing_data = 0
         events_with_malformed_data = 0
-        duplicate_order_ids = set()
-        order_id_counts = {}
+        
+        # Разделяем статистику по источникам данных
+        events_api_stats = {"event_ids": set(), "order_ids": set(), "count": 0}
+        checkout_forms_stats = {"order_ids": {}, "count": 0}
+        other_stats = {"count": 0}
         
         logger.info(f"🔍 Анализ аномалий в {total_events} событиях заказов...")
         
         for event in order_events:
+            source = event.get('source', "unknown")
+            logger.debug(f"🔍 Анализ события из источника: {source}")
+            
             # Проверяем базовую структуру события
-            if not self._validate_event_structure(event):
+            if not self._validate_event_structure(event, source):
+                logger.debug(f"❌ Событие не прошло проверку структуры: {source}")
                 events_with_malformed_data += 1
                 continue
                 
             # Извлекаем order_id безопасно
-            order_id = self._extract_order_id_safe(event)
+            order_id = self._extract_order_id_safe(event, source)
             if not order_id:
+                logger.debug(f"❌ Не удалось извлечь order_id из события: {source}")
                 events_with_missing_data += 1
                 continue
                 
-            # Подсчитываем события для каждого заказа
-            order_id_counts[order_id] = order_id_counts.get(order_id, 0) + 1
+            # Собираем статистику по источникам данных
+            if source == 'events_api':
+                events_api_stats["count"] += 1
+                events_api_stats["order_ids"].add(order_id)
+                # Для Events API собираем event_id для проверки дубликатов
+                event_info = event.get('event', {})
+                event_id = event_info.get('id')
+                if event_id:
+                    events_api_stats["event_ids"].add(event_id)
+            elif source in ['checkout_forms_api', 'full_api_details']:
+                checkout_forms_stats["count"] += 1
+                checkout_forms_stats["order_ids"][order_id] = checkout_forms_stats["order_ids"].get(order_id, 0) + 1
+            else:
+                other_stats["count"] += 1
             
             # Проверяем качество данных заказа
-            if not self._validate_order_data_quality(event):
+            if not self._validate_order_data_quality(event, source):
+                logger.debug(f"❌ Событие {order_id} не прошло проверку качества данных: {source}")
                 events_with_missing_data += 1
+            else:
+                logger.debug(f"✅ Событие {order_id} прошло все проверки: {source}")
                 
-        # Анализ дубликатов
-        duplicates = {oid: count for oid, count in order_id_counts.items() if count > 1}
-        if duplicates:
-            duplicate_count = sum(duplicates.values()) - len(duplicates)
-            anomalies.append(f"⚠️ Обнаружено {duplicate_count} дублированных событий для {len(duplicates)} заказов")
+        # Анализ дубликатов ТОЛЬКО для Events API (по event_id)
+        if events_api_stats["count"] > 0:
+            total_events_api = events_api_stats["count"]
+            unique_event_ids = len(events_api_stats["event_ids"])
+            if unique_event_ids < total_events_api:
+                duplicate_events = total_events_api - unique_event_ids
+                anomalies.append(f"⚠️ Обнаружено {duplicate_events} дублированных событий (по event_id) из {total_events_api}")
+
+        # Анализ дубликатов для Checkout Forms API (по order_id - здесь это действительно дубликаты)
+        checkout_duplicates = {oid: count for oid, count in checkout_forms_stats["order_ids"].items() if count > 1}
+        if checkout_duplicates:
+            duplicate_count = sum(checkout_duplicates.values()) - len(checkout_duplicates)
+            anomalies.append(f"⚠️ Обнаружено {duplicate_count} дублированных заказов в Checkout Forms API")
         
         # Анализ качества данных
         missing_data_ratio = events_with_missing_data / total_events
@@ -464,10 +494,12 @@ class DataMonitoringService:
         if malformed_ratio > 0.05:  # Более 5% событий с проблемами структуры
             anomalies.append(f"❌ {malformed_ratio:.1%} событий имеют некорректную структуру")
             
-        # Проверка разнообразия событий
-        unique_orders = len(order_id_counts)
-        if unique_orders < total_events * 0.5:  # Слишком много повторов
-            anomalies.append(f"⚠️ Низкое разнообразие заказов: {unique_orders} уникальных из {total_events} событий")
+        # Проверка разнообразия ТОЛЬКО для Checkout Forms API (для Events API это нормально)
+        if checkout_forms_stats["count"] > 0:
+            unique_checkout_orders = len(checkout_forms_stats["order_ids"])
+            checkout_total = checkout_forms_stats["count"]
+            if unique_checkout_orders < checkout_total * 0.5:  # Слишком много повторов в заказах
+                anomalies.append(f"⚠️ Низкое разнообразие в Checkout Forms API: {unique_checkout_orders} уникальных из {checkout_total} заказов")
             
         if not anomalies:
             logger.info("✅ Аномалий в данных событий не обнаружено")
@@ -476,51 +508,131 @@ class DataMonitoringService:
             
         return anomalies
     
-    def _validate_event_structure(self, event: Dict[str, Any]) -> bool:
+    def _validate_event_structure(self, event: Dict[str, Any], source: str) -> bool:
         """Проверка базовой структуры события"""
-        required_fields = ['id', 'type', 'event']
-        return all(field in event for field in required_fields)
+        try:
+            logger.debug(f"🔍 Проверка структуры события из источника: {source}")
+            
+            if source == 'events_api':
+                # Для Events API требуем поля event с order внутри
+                required_root_fields = ['event', 'order_id', 'source']
+                if not all(field in event for field in required_root_fields):
+                    logger.debug(f"❌ Отсутствуют корневые поля для events_api: {required_root_fields}")
+                    return False
+                    
+                event_info = event.get('event', {})
+                required_event_fields = ['id', 'type']
+                if not all(field in event_info for field in required_event_fields):
+                    logger.debug(f"❌ Отсутствуют поля события для events_api: {required_event_fields}")
+                    return False
+                    
+                return True
+                
+            elif source in ['checkout_forms_api', 'full_api_details']:
+                # Для Checkout Forms API и Full API Details требуем поля order с данными заказа внутри
+                # full_api_details использует ту же структуру что и checkout_forms_api
+                required_root_fields = ['order', 'order_id', 'source']
+                if not all(field in event for field in required_root_fields):
+                    logger.debug(f"❌ Отсутствуют корневые поля для {source}: {required_root_fields}")
+                    return False
+                    
+                order_data = event.get('order', {})
+                if not order_data:
+                    logger.debug("❌ Пустые данные заказа")
+                    return False
+                    
+                # Проверяем ключевые поля заказа
+                required_order_fields = ['id', 'status', 'buyer', 'lineItems', 'delivery', 'fulfillment']
+                missing_fields = [field for field in required_order_fields if not order_data.get(field)]
+                
+                if missing_fields:
+                    logger.debug(f"❌ Отсутствуют поля заказа: {missing_fields}")
+                    return False
+                    
+                return True
+                
+            else:
+                logger.error(f"❌ Неизвестный источник данных: {source}")
+                return False
+                
+        except (AttributeError, KeyError, TypeError) as e:
+            logger.debug(f"❌ Ошибка валидации структуры события: {e}")
+            return False
     
-    def _extract_order_id_safe(self, event: Dict[str, Any]) -> Optional[str]:
+    def _extract_order_id_safe(self, event: Dict[str, Any], source: str) -> Optional[str]:
         """Безопасное извлечение order_id из события"""
         try:
-            # Пробуем разные пути извлечения order_id
-            order_data = event.get('order', {})
-            
-            # Сначала пробуем checkoutForm.id (правильный путь для Allegro)
-            if 'checkoutForm' in order_data and 'id' in order_data['checkoutForm']:
-                return order_data['checkoutForm']['id']
+            if source == 'events_api':
+                # Для Events API order_id уже извлечен и находится в корне
+                order_id = event.get('order_id')
+                logger.debug(f"🔍 Извлечен order_id из events_api: {order_id}")
+                return order_id
                 
-            # Затем пробуем прямо order.id (старый путь)
-            if 'id' in order_data:
-                return order_data['id']
+            elif source in ['checkout_forms_api', 'full_api_details']:
+                # Для Checkout Forms API и Full API Details order_id уже извлечен и находится в корне
+                order_id = event.get('order_id')
+                logger.debug(f"🔍 Извлечен order_id из {source}: {order_id}")
+                return order_id
                 
-            # Если ничего не найдено
-            return None
+            else:
+                logger.error(f"❌ Неизвестный источник данных: {source}")
+                return None
             
-        except (AttributeError, KeyError, TypeError):
+        except (AttributeError, KeyError, TypeError) as e:
+            logger.debug(f"❌ Ошибка извлечения order_id: {e}")
             return None
     
-    def _validate_order_data_quality(self, event: Dict[str, Any]) -> bool:
+    def _validate_order_data_quality(self, event: Dict[str, Any], source: str) -> bool:
         """Проверка качества данных заказа в событии"""
         try:
-            order_data = event.get('order', {})
+            if source in ['events_api', 'checkout_forms_api', 'full_api_details']:
+                order_data = event.get('order', {})
+            else:
+                logger.error(f"❌ Неизвестный источник данных: {source}")
+                return False
             
             # Базовые поля, которые должны присутствовать
             if not order_data:
+                logger.debug("❌ Отсутствуют данные заказа")
                 return False
                 
-            # Проверяем наличие ключевых полей
-            checkout_form = order_data.get('checkoutForm', {})
-            if not checkout_form:
-                return False
+            # Проверка качества данных в зависимости от источника
+            if source == 'events_api':
+                # Для Events API проверяем специфичную структуру
+                has_checkout_form = bool(order_data.get('checkoutForm'))
+                has_checkout_id = bool(order_data.get('checkoutForm', {}).get('id')) if has_checkout_form else False
+                has_buyer = bool(order_data.get('buyer'))
+                has_line_items = bool(order_data.get('lineItems'))
                 
-            # Минимальные данные для валидного заказа
-            has_id = bool(checkout_form.get('id'))
-            has_status = bool(checkout_form.get('status'))
-            has_buyer = bool(checkout_form.get('buyer'))
+                quality_check = has_checkout_form and has_checkout_id and has_buyer and has_line_items
+                
+                if not quality_check:
+                    missing_parts = []
+                    if not has_checkout_form: missing_parts.append("checkoutForm")
+                    if not has_checkout_id: missing_parts.append("checkoutForm.id")
+                    if not has_buyer: missing_parts.append("buyer")
+                    if not has_line_items: missing_parts.append("lineItems")
+                    logger.debug(f"❌ Неполные данные заказа Events API, отсутствуют: {missing_parts}")
+                    
+            else:
+                # Для Checkout Forms API и Full API Details проверяем полную структуру
+                has_id = bool(order_data.get('id'))
+                has_status = bool(order_data.get('status'))
+                has_buyer = bool(order_data.get('buyer'))
+                has_line_items = bool(order_data.get('lineItems'))
+                
+                quality_check = has_id and has_status and has_buyer and has_line_items
+                
+                if not quality_check:
+                    missing_parts = []
+                    if not has_id: missing_parts.append("id")
+                    if not has_status: missing_parts.append("status")
+                    if not has_buyer: missing_parts.append("buyer")
+                    if not has_line_items: missing_parts.append("lineItems")
+                    logger.debug(f"❌ Неполные данные заказа {source}, отсутствуют: {missing_parts}")
             
-            return has_id and has_status and has_buyer
+            return quality_check
             
-        except (AttributeError, KeyError, TypeError):
+        except (AttributeError, KeyError, TypeError) as e:
+            logger.debug(f"❌ Ошибка валидации качества данных: {e}")
             return False 

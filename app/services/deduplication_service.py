@@ -39,6 +39,9 @@ class DeduplicationService:
         """
         Проверка, нужно ли обрабатывать заказ для данного токена.
         
+        ВАЖНО: С новой логикой проверки revision мы ВСЕГДА разрешаем обработку заказов,
+        так как решение о создании/обновлении/пропуске принимается на уровне revision.
+        
         Args:
             allegro_order_id: ID заказа в Allegro
             token_id: ID токена, который хочет обработать заказ
@@ -59,27 +62,12 @@ class DeduplicationService:
                     "reason": "Токен не найден"
                 }
             
-            # Проверяем, существует ли заказ для этого токена
-            existing_order = self.db.exec(
-                select(Order).where(
-                    Order.allegro_order_id == allegro_order_id,
-                    Order.token_id == token_id
-                )
-            ).first()
-            
-            if existing_order:
-                # Заказ уже существует для этого токена
-                return {
-                    "should_process": False,
-                    "reason": f"Заказ уже существует для токена {token_id}",
-                    "existing_order_id": existing_order.id
-                }
-            else:
-                # Новый заказ для этого токена
-                return {
-                    "should_process": True,
-                    "reason": "Новый заказ для токена"
-                }
+            # С новой логикой revision мы ВСЕГДА разрешаем обработку
+            # Решение о создании/обновлении/пропуске принимается в _check_order_needs_update
+            return {
+                "should_process": True,
+                "reason": "Разрешена обработка для проверки revision"
+            }
                 
         except Exception as e:
             logger.error(f"❌ Ошибка при проверке заказа {allegro_order_id}: {e}")

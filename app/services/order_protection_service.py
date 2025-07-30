@@ -59,16 +59,18 @@ class OrderProtectionService:
         # 1. Проверка обязательных полей в зависимости от типа операции
         if existing_order is None:
             # Для новых заказов требуем минимальный набор полей из Allegro API
-            # Структура данных Allegro: {id, status, buyer?, lineItems?, ...}
-            required_fields = ["id"]  # id - единственное обязательное поле для Allegro API
+            # Структура данных Events API: {checkoutForm: {id, revision}, buyer?, lineItems?, ...}
+            # Структура данных Checkout Forms API: {id, status, buyer?, lineItems?, ...}
+            required_fields = self._get_required_fields_for_structure(new_data)
         else:
-            # Для обновлений достаточно ID
-            required_fields = ["id"]
+            # Для обновлений достаточно ID в любой из структур
+            required_fields = self._get_required_fields_for_structure(new_data)
             
         missing_fields = []
         
+        # Проверяем наличие обязательных полей с учетом структуры данных
         for field in required_fields:
-            if field not in new_data or not new_data[field]:
+            if not self._has_required_field(new_data, field):
                 missing_fields.append(field)
                 
         if missing_fields:
@@ -138,32 +140,42 @@ class OrderProtectionService:
         """Проверяет корректность структуры данных заказа от Allegro API"""
         
         # Проверяем основную структуру данных согласно реальной структуре Allegro API
-        # Только ID обязательно, остальные поля опциональные
+        # Структура зависит от источника: Events API vs Checkout Forms API
         expected_structure = {
-            "id": str,                    # Обязательное поле
-            "status": str,                # Опционально: статус заказа (READY_FOR_PROCESSING, etc.)
+            # Общие поля для обеих структур
             "buyer": dict,                # Опционально: данные покупателя
             "lineItems": list,            # Опционально: товары в заказе
-            "summary": dict,              # Опционально: итоговая информация
-            "revision": str,              # Опционально: ревизия заказа (строка)
-            "delivery": dict,             # Опционально: данные доставки
-            "payment": dict,              # Опционально: данные оплаты
-            "fulfillment": dict,          # Опционально: данные выполнения
-            "invoice": dict,              # Опционально: данные счета
             "marketplace": dict,          # Опционально: данные маркетплейса
-            "updatedAt": str,             # Опционально: время обновления (ISO string)
-            "note": dict,                 # ИСПРАВЛЕНО: note это объект с полем text
-            "messageToSeller": str,       # Опционально: сообщение продавцу
-            "surcharges": list,           # Опционально: доплаты
-            "discounts": list             # Опционально: скидки
+            
+            # Поля из Checkout Forms API
+            "id": str,                    # ID заказа (только в Checkout Forms API)
+            "status": str,                # Статус заказа (только в Checkout Forms API)
+            "summary": dict,              # Итоговая информация
+            "revision": str,              # Ревизия заказа (строка)
+            "delivery": dict,             # Данные доставки
+            "payment": dict,              # Данные оплаты
+            "fulfillment": dict,          # Данные выполнения
+            "invoice": dict,              # Данные счета
+            "updatedAt": str,             # Время обновления (ISO string)
+            "note": dict,                 # note это объект с полем text
+            "messageToSeller": str,       # Сообщение продавцу
+            "surcharges": list,           # Доплаты
+            "discounts": list,            # Скидки
+            
+            # Поля из Events API
+            "checkoutForm": dict,         # Форма заказа с ID и revision (только в Events API)
+            "seller": dict,               # Данные продавца (в основном в Events API)
         }
         
-        # Обязательные поля только для создания
-        required_fields = ["id"] if not is_update else []
+        # Определяем обязательные поля в зависимости от структуры данных
+        if not is_update:
+            required_fields = self._get_required_fields_for_structure(data)
+        else:
+            required_fields = []  # Для обновлений не требуем обязательных полей
         
-        # Проверяем обязательные поля
+        # Проверяем обязательные поля с использованием новой логики
         for field in required_fields:
-            if field not in data or data[field] is None:
+            if not self._has_required_field(data, field):
                 logger.error(f"❌ Отсутствует обязательное поле: {field}")
                 return False
         
@@ -258,10 +270,7 @@ class OrderProtectionService:
             else:
                 result["action"] = "created"
                 
-            # 5. Сохранение события (ПЕРЕД обновлением заказа!)
-            self._save_order_event(order_id, "ORDER_SYNC", new_data, allegro_revision)
-            
-            # 6. Обновление/создание заказа
+            # 5. Обновление/создание заказа
             if existing_order:
                 self._update_existing_order(existing_order, final_data, allegro_revision, order_date)
             else:
@@ -332,8 +341,68 @@ class OrderProtectionService:
         self.db.add(order_event)
         logger.info(f"📝 Сохранено событие {event_type} для заказа {order_id}")
         
+    def _get_required_fields_for_structure(self, data: Dict[str, Any]) -> List[str]:
+        """
+        Определяет обязательные поля в зависимости от структуры данных.
+        
+        Args:
+            data: Данные заказа для анализа структуры
+            
+        Returns:
+            List[str]: Список обязательных полей для данной структуры
+        """
+        
+        # Проверяем, какая структура данных у нас есть
+        if "checkoutForm" in data and isinstance(data["checkoutForm"], dict):
+            # Структура из Events API: {checkoutForm: {id, revision}, ...}
+            return ["checkout_form_id"]  # Логическое имя для checkoutForm.id
+        elif "id" in data:
+            # Структура из Checkout Forms API: {id, status, ...}
+            return ["id"]
+        else:
+            # Неизвестная структура - требуем хотя бы один из ID
+            return ["order_id"]  # Общее требование наличия ID заказа
+            
+    def _has_required_field(self, data: Dict[str, Any], field: str) -> bool:
+        """
+        Проверяет наличие обязательного поля с учетом разных структур данных.
+        
+        Args:
+            data: Данные заказа
+            field: Обязательное поле для проверки
+            
+        Returns:
+            bool: True если поле присутствует и не пустое
+        """
+        
+        if field == "checkout_form_id":
+            # Проверяем checkoutForm.id для Events API
+            checkout_form = data.get("checkoutForm", {})
+            if isinstance(checkout_form, dict):
+                return bool(checkout_form.get("id"))
+            return False
+            
+        elif field == "id":
+            # Проверяем прямое поле id для Checkout Forms API
+            return bool(data.get("id"))
+            
+        elif field == "order_id":
+            # Проверяем наличие ID заказа в любой из возможных структур
+            # 1. checkoutForm.id (Events API)
+            checkout_form = data.get("checkoutForm", {})
+            if isinstance(checkout_form, dict) and checkout_form.get("id"):
+                return True
+            # 2. Прямое поле id (Checkout Forms API)
+            if data.get("id"):
+                return True
+            return False
+            
+        else:
+            # Обычная проверка поля
+            return bool(data.get(field))
+            
     def _update_existing_order(self, order: Order, data: Dict[str, Any], 
-                              allegro_revision: Optional[str] = None) -> Dict[str, Any]:
+                              allegro_revision: Optional[str] = None, order_date: Optional[datetime] = None) -> Dict[str, Any]:
         """Обновление существующего заказа"""
         
         # Добавляем revision в данные заказа

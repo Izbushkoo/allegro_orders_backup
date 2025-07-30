@@ -9,6 +9,8 @@ from typing import Optional, Dict, Any
 from uuid import UUID
 
 from sqlmodel import SQLModel, Field, Relationship, Column, JSON, UniqueConstraint
+from sqlalchemy import ForeignKey
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 from .base import BaseModel
 
@@ -22,7 +24,7 @@ class OrderEventBase(SQLModel):
     )
     
     token_id: UUID = Field(
-        foreign_key="user_tokens.id",
+        sa_column=Column(PG_UUID, ForeignKey("user_tokens.id", ondelete="CASCADE")),
         description="ID токена пользователя"
     )
     

@@ -41,6 +41,10 @@ from .order_technical_flags import (
     InvoiceStatusUpdate,
     OrderWithTechnicalFlags
 )
+from .failed_order_processing import (
+    FailedOrderProcessing,
+    FailedOrderStatus
+)
 
 __all__ = [
     "BaseModel",
@@ -70,4 +74,6 @@ __all__ = [
     "StockStatusUpdate",
     "InvoiceStatusUpdate",
     "OrderWithTechnicalFlags",
+    "FailedOrderProcessing",
+    "FailedOrderStatus",
 ] 

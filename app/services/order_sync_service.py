@@ -5,7 +5,7 @@
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 from sqlmodel import Session
@@ -16,6 +16,7 @@ from app.services.allegro_auth_service import AllegroAuthService
 from app.services.deduplication_service import DeduplicationService
 from app.models.sync_history import SyncHistory, SyncStatus
 from app.models.order_event import OrderEvent
+from app.models.failed_order_processing import FailedOrderProcessing, FailedOrderStatus
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -176,12 +177,13 @@ class OrderSyncService:
                             sync_result["orders_skipped"] += 1
                             
                     else:
-                        # Данные получены через Events API - сохраняем события
+                        # Данные получены через Events API - НОВАЯ ЛОГИКА
                         logger.info("📡 Обработка события из Events API")
                         
                         # Извлекаем ID события для дедупликации
                         event_info = data_item.get("event", {})
                         allegro_event_id = event_info.get("id")
+                        order_id = data_item.get("order_id")
                         
                         # Проверяем, нужно ли обрабатывать это событие
                         if allegro_event_id:
@@ -194,39 +196,99 @@ class OrderSyncService:
                                 sync_result["events_deduplicated"] += 1
                                 continue
                         
-                        # Сохраняем событие в базу данных
+                        # ✅ ШАГ 1: Сохраняем событие в базу данных (независимо от типа)
                         self._save_all_events_to_db(data_item)
                         sync_result["events_saved"] += 1
                         
-                        # Обрабатываем заказ только для определенных типов событий
-                        event_type = event_info.get("type")
-                        if event_type in ["BOUGHT", "FILLED_IN", "READY_FOR_PROCESSING", "BUYER_CANCELLED", "FULFILLMENT_STATUS_CHANGED", "AUTO_CANCELLED"]:
+                        # ✅ ШАГ 2: Проверяем нужно ли создавать/обновлять заказ
+                        if order_id:
+                            # Проверяем дедупликацию заказа
+                            order_decision = self.deduplication_service.should_process_order(
+                                order_id, UUID(self.token_id)
+                            )
                             
-                            # Проверяем, нужно ли обрабатывать этот заказ
-                            order_id = data_item.get("order_id")
-                            if order_id:
-                                order_decision = self.deduplication_service.should_process_order(
-                                    order_id, UUID(self.token_id)
+                            if not order_decision["should_process"]:
+                                logger.info(f"🔄 Заказ {order_id} пропущен: {order_decision['reason']}")
+                                sync_result["orders_deduplicated"] += 1
+                                continue
+                            
+                            # Извлекаем revision из checkoutForm
+                            checkout_form = data_item.get("order", {}).get("checkoutForm", {})
+                            new_revision = checkout_form.get("revision")
+                            
+                            if not new_revision:
+                                logger.warning(f"⚠️ Revision не найдена в событии для заказа {order_id}")
+                                # Используем fallback revision на основе времени события
+                                event_occurred_at = event_info.get("occurredAt")
+                                if event_occurred_at:
+                                    try:
+                                        occurred_dt = datetime.fromisoformat(event_occurred_at.replace("Z", "+00:00"))
+                                        new_revision = str(int(occurred_dt.timestamp()))
+                                    except:
+                                        new_revision = str(int(datetime.utcnow().timestamp()))
+                                else:
+                                    new_revision = str(int(datetime.utcnow().timestamp()))
+                                logger.info(f"🔧 Используется fallback revision: {new_revision}")
+                            
+                            # Проверяем нужно ли создавать/обновлять заказ
+                            update_check = self._check_order_needs_update(order_id, new_revision)
+                            
+                            if update_check["action"] == "skip":
+                                logger.info(f"⏭️ Заказ {order_id} пропущен - revision не изменилась")
+                                sync_result["orders_skipped"] += 1
+                                continue
+                            
+                            # ✅ ШАГ 3: Получаем полные детали заказа и создаем/обновляем
+                            logger.info(f"🔍 Получение полных деталей заказа {order_id} (действие: {update_check['action']})")
+                            
+                            order_details = self._get_order_details_from_api(order_id)
+                            
+                            if order_details:
+                                logger.info(f"💾 {update_check['action'].title()} заказа {order_id} на основе полных деталей")
+                                
+                                # Создаем структуру данных для обработки заказа
+                                order_data_item = {
+                                    "order": order_details,
+                                    "order_id": order_id,
+                                    "source": "full_api_details"
+                                }
+                                
+                                # Обрабатываем заказ с полными деталями
+                                result = self._process_single_order_safe(order_data_item)
+                                
+                                # Обновляем статистику
+                                sync_result["orders_processed"] += 1
+                                if result["action"] == "created":
+                                    sync_result["orders_created"] += 1
+                                elif result["action"] == "updated":
+                                    sync_result["orders_updated"] += 1
+                                elif result["action"] == "skipped":
+                                    sync_result["orders_skipped"] += 1
+                                    
+                                logger.info(f"✅ Заказ {order_id} обработан: {result['action']}")
+                                
+                            else:
+                                # ❌ Не удалось получить детали заказа - сохраняем для повторной обработки
+                                logger.warning(f"⚠️ Не удалось получить детали заказа {order_id}, сохраняем для повторной обработки")
+                                
+                                error_message = f"Не удалось получить детали заказа через API после retry"
+                                saved = self._save_failed_order(
+                                    order_id=order_id,
+                                    action_required=update_check['action'],
+                                    error_message=error_message,
+                                    error_type="api_fetch_failed",
+                                    event_data=data_item,
+                                    expected_revision=new_revision
                                 )
                                 
-                                if not order_decision["should_process"]:
-                                    logger.info(f"🔄 Заказ {order_id} пропущен: {order_decision['reason']}")
-                                    sync_result["orders_deduplicated"] += 1
-                                    continue
-                            
-                            # Обрабатываем заказ
-                            result = self._process_single_order_safe(data_item)
-                            
-                            # Обновляем статистику
-                            sync_result["orders_processed"] += 1
-                            if result["action"] == "created":
-                                sync_result["orders_created"] += 1
-                            elif result["action"] == "updated":
-                                sync_result["orders_updated"] += 1
-                            elif result["action"] == "skipped":
-                                sync_result["orders_skipped"] += 1
+                                if saved:
+                                    logger.info(f"💾 Заказ {order_id} сохранен для повторной обработки")
+                                else:
+                                    logger.error(f"❌ Не удалось сохранить проблемный заказ {order_id}")
+                                    
+                                sync_result["orders_failed"] += 1
                         else:
-                            logger.info(f"📝 Событие {event_type} сохранено, но заказ не обработан")
+                            logger.info("📝 Событие сохранено, но order_id отсутствует - заказ не обработан")
                         
                 except DataIntegrityError as e:
                     logger.error(f"❌ Ошибка целостности данных для события {data_item.get('event', {}).get('id', 'unknown')}: {e}")
@@ -242,7 +304,6 @@ class OrderSyncService:
             
             # 🔍 4. Анализ качества полученных данных
             logger.info(f"🔍 Анализ качества {len(orders_data)} событий...")
-            
             anomalies = self.monitoring_service.detect_data_anomalies(orders_data)
             if anomalies:
                 sync_result["warnings"].extend(anomalies)
@@ -421,7 +482,7 @@ class OrderSyncService:
             from app.models.order_event import OrderEvent
             from uuid import UUID
             
-            # Ищем последнее событие для данного токена
+            # Ищем последнее событие для данного токена (включая специальные события)
             query = select(OrderEvent).where(
                 OrderEvent.token_id == UUID(self.token_id),
                 OrderEvent.event_id.isnot(None)  # Только события с event_id
@@ -430,19 +491,22 @@ class OrderSyncService:
             last_event = self.db.exec(query).first()
             
             if last_event and last_event.event_id:
-                logger.info(f"🔍 Найден последний event_id в БД: {last_event.event_id}")
+                if last_event.order_id == "SYNC_STARTING_POINT":
+                    logger.info(f"🔍 Найден последний event_id стартовой точки в БД: {last_event.event_id}")
+                else:
+                    logger.info(f"🔍 Найден последний event_id в БД: {last_event.event_id}")
                 return last_event.event_id
             else:
                 logger.info("🔍 Event_id в БД не найден, получаем текущую точку от Allegro API")
                 
                 # Получаем текущую точку событий от Allegro API
-                current_event_id = self._get_current_event_point_from_api()
+                current_event = self._get_current_event_point_from_api()
                 
-                if current_event_id:
+                if current_event:
                     # Сохраняем стартовую точку в БД как специальное событие
-                    self._save_starting_point_event(current_event_id)
-                    logger.info(f"🎯 Установлена стартовая точка event_id: {current_event_id}")
-                    return current_event_id
+                    self._save_starting_point_event(current_event["event_id"], current_event["occurred_at"])
+                    logger.info(f"🎯 Установлена стартовая точка event_id: {current_event['event_id']}")
+                    return current_event["event_id"]
                 else:
                     logger.warning("⚠️ Не удалось получить текущую точку событий")
                     return None
@@ -451,14 +515,14 @@ class OrderSyncService:
             logger.error(f"❌ Ошибка при получении event_id: {e}")
             return None
 
-    def _get_current_event_point_from_api(self) -> Optional[str]:
+    def _get_current_event_point_from_api(self) -> Optional[Dict[str, Any]]:
         """
         Получает текущую точку событий от Allegro API через Statistics endpoint.
         
-        Использует API: GET /order/events/statistics
+        Использует API: GET /order/event-stats
         
         Returns:
-            Optional[str]: Текущий event_id или None при ошибке
+            Optional[Dict]: Словарь с event_id и occurred_at (datetime объект) или None при ошибке
         """
         
         try:
@@ -494,7 +558,7 @@ class OrderSyncService:
             }
             
             # URL для получения статистики событий
-            url = "https://api.allegro.pl/order/events/statistics"
+            url = "https://api.allegro.pl/order/event-stats"
             
             # Выполняем запрос к Allegro API
             with httpx.Client() as client:
@@ -505,13 +569,19 @@ class OrderSyncService:
                 latest_event = data.get("latestEvent", {})
                 
                 event_id = latest_event.get("id")
-                occurred_at = latest_event.get("occurredAt")
+                occurred_at_str = latest_event.get("occurredAt")
                 
-                if event_id:
-                    logger.info(f"📊 Получена текущая точка событий: id={event_id}, time={occurred_at}")
-                    return event_id
+                if event_id and occurred_at_str:
+                    # Парсим строку даты в объект datetime
+                    try:
+                        occurred_at = datetime.fromisoformat(occurred_at_str.replace("Z", "+00:00"))
+                        logger.info(f"📊 Получена текущая точка событий: id={event_id}, time={occurred_at}")
+                        return {"event_id": event_id, "occurred_at": occurred_at}
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"❌ Ошибка парсинга даты события {occurred_at_str}: {e}")
+                        return None
                 else:
-                    logger.warning("⚠️ В ответе API отсутствует event_id")
+                    logger.warning("⚠️ В ответе API отсутствует event_id или occurredAt")
                     return None
                 
         except httpx.HTTPStatusError as e:
@@ -527,7 +597,7 @@ class OrderSyncService:
             logger.error(f"❌ Неожиданная ошибка при получении статистики событий: {e}")
             return None
 
-    def _save_starting_point_event(self, event_id: str):
+    def _save_starting_point_event(self, event_id: str, occurred_at: datetime):
         """
         Сохраняет стартовую точку событий как специальное событие в БД.
         
@@ -535,14 +605,16 @@ class OrderSyncService:
         
         Args:
             event_id: ID события - стартовая точка для синхронизации
+            occurred_at: Время события (объект datetime)
         """
         
         from app.models.order_event import OrderEvent
         
         try:
             # Создаем специальное событие для маркировки стартовой точки
+            # Используем специальное значение order_id вместо None
             starting_point_event = OrderEvent(
-                order_id=None,  # Это не связано с конкретным заказом
+                order_id="SYNC_STARTING_POINT",  # Специальное значение вместо None
                 token_id=self.token_id,
                 event_type="SYNC_STARTING_POINT",
                 event_data={
@@ -551,7 +623,7 @@ class OrderSyncService:
                     "created_at": datetime.utcnow().isoformat(),
                     "source": "allegro_events_statistics_api"
                 },
-                occurred_at=datetime.utcnow(),
+                occurred_at=occurred_at,
                 event_id=event_id,  # Сохраняем event_id для пагинации
                 is_duplicate=False
             )
@@ -566,19 +638,39 @@ class OrderSyncService:
             self.db.rollback()
             # Не прерываем процесс из-за ошибки сохранения стартовой точки
 
+    def _extract_order_id_from_event(self, event: Dict[str, Any]) -> Optional[str]:
+        """
+        Простое извлечение order_id из события.
+        
+        Args:
+            event: Событие от Allegro API
+            
+        Returns:
+            Optional[str]: order_id или None
+        """
+        order_data = event.get("order", {})
+        if not order_data:
+            return None
+            
+        checkout_form = order_data.get("checkoutForm", {})
+        if isinstance(checkout_form, dict):
+            return checkout_form.get("id")
+            
+        return None
+
     def _fetch_order_events_safe(self, from_event_id: Optional[str] = None, sync_to_date: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """
-        Безопасное получение событий заказов от Allegro API.
+        Простое получение событий заказов от Allegro API.
         
-        ВАЖНО: Events API возвращает только метаданные событий, без полных данных заказа!
-        Для каждого события нужно дополнительно получать данные заказа через Checkout Forms API.
+        Метод только получает события и возвращает их в простом формате.
+        Вся сложная логика обработки событий выполняется в sync_orders_safe.
         
         Args:
             from_event_id: ID события, с которого начинать извлечение (опционально)
             sync_to_date: Дата окончания синхронизации - события новее этой даты будут отфильтрованы
             
         Returns:
-            List: Список событий с полными данными заказов от Allegro API
+            List: Простой список событий для обработки в sync_orders_safe
         """
         
         try:
@@ -655,105 +747,22 @@ class OrderSyncService:
                     events = filtered_events
                     logger.info(f"🗓️ После фильтрации по дате окончания: {len(events)} событий")
                 
-                # ВАЖНО: События содержат только метаданные, нужно получить полные данные заказов
-                # Для каждого события с order_id получаем полные данные через Checkout Forms API
-                valid_events = []
+                # Возвращаем события в простом формате
+                # Вся обработка структуры данных теперь в sync_orders_safe
+                simple_events = []
                 
                 for event in events:
-                    event_data = {
-                        "id": event.get("id"),
-                        "type": event.get("type"),
-                        "occurredAt": event.get("occurredAt"),
-                        "publishedAt": event.get("publishedAt")
+                    # Простая структура для sync_orders_safe
+                    event_record = {
+                        "event": event,  # Полное событие как есть от API
+                        "order": event.get("order", {}),  # Данные заказа
+                        "order_id": self._extract_order_id_from_event(event),  # Простое извлечение order_id
+                        "source": "events_api"
                     }
-                    
-                    # Пытаемся извлечь order_id из события согласно реальной структуре API
-                    order_id = None
-                    order_data = event.get("order", {})
-                    
-                    # Проверяем различные возможные места расположения order_id
-                    if order_data:
-                        # 1. Пытаемся найти в checkoutForm.id
-                        checkout_form = order_data.get("checkoutForm", {})
-                        if checkout_form and isinstance(checkout_form, dict):
-                            order_id = checkout_form.get("id")
-                        
-                        # 2. Если не найдено, проверяем прямо в order.id  
-                        if not order_id:
-                            order_id = order_data.get("id")
-                    
-                    # 3. Если все еще не найдено, проверяем корневой уровень события
-                    if not order_id:
-                        # Иногда order_id может быть в корне события
-                        order_id = event.get("orderId") or event.get("order_id")
-                    
-                    # 4. Последняя попытка - извлечь из других полей заказа
-                    if not order_id and order_data:
-                        # Если checkoutForm пустой объект {}, возможно order_id находится в другом месте
-                        # Проверяем все поля order_data на наличие ID-подобных значений
-                        for key, value in order_data.items():
-                            if key in ['id', 'orderId', 'checkoutFormId'] and value:
-                                order_id = value
-                                break
-                    
-                    if order_id:
-                        # Получаем полные данные заказа через отдельный API вызов
-                        full_order_data = self._fetch_order_details_safe(order_id, headers)
-                        
-                        if full_order_data:
-                            event_record = {
-                                "event": event_data,
-                                "order": full_order_data,  # Полные данные заказа
-                                "order_id": order_id,
-                                "source": "events_api"  # Помечаем источник данных
-                            }
-                            valid_events.append(event_record)
-                            logger.info(f"✅ Событие {event.get('type')} для заказа {order_id} с полными данными добавлено")
-                        else:
-                            # Если не удалось получить данные заказа, сохраняем только событие
-                            event_record = {
-                                "event": event_data,
-                                "order": {},  # Пустые данные заказа
-                                "order_id": order_id,
-                                "source": "events_api"
-                            }
-                            valid_events.append(event_record)
-                            logger.warning(f"⚠️ Событие {event.get('type')} для заказа {order_id} без данных заказа")
-                    else:
-                        # Событие без order_id (может быть системное событие)
-                        event_record = {
-                            "event": event_data,
-                            "order": {},  # Пустые данные заказа
-                            "order_id": None,
-                            "source": "events_api"
-                        }
-                        valid_events.append(event_record)
-                        logger.info(f"✅ Событие {event.get('type')} без order_id добавлено")
-                        
-                        # Логируем структуру события для отладки
-                        logger.debug(f"🔍 Структура события без order_id: {event}")
-                        
-                        # Дополнительная диагностика для понимания структуры
-                        if logger.isEnabledFor(logging.DEBUG):
-                            event_keys = list(event.keys()) if isinstance(event, dict) else "НЕ СЛОВАРЬ"
-                            order_info = event.get("order", "НЕТ ПОЛЯ ORDER")
-                            if isinstance(order_info, dict):
-                                order_keys = list(order_info.keys())
-                                logger.debug(f"🔍 Ключи события: {event_keys}")
-                                logger.debug(f"🔍 Ключи order: {order_keys}")
-                                
-                                # Анализируем все поля на предмет содержания ID
-                                for key, value in order_info.items():
-                                    if isinstance(value, (str, int)) and ("id" in key.lower() or len(str(value)) > 10):
-                                        logger.debug(f"🔍 Потенциальный ID в order.{key}: {value}")
-                                    elif isinstance(value, dict) and value:
-                                        for sub_key, sub_value in value.items():
-                                            if isinstance(sub_value, (str, int)) and ("id" in sub_key.lower() or len(str(sub_value)) > 10):
-                                                logger.debug(f"🔍 Потенциальный ID в order.{key}.{sub_key}: {sub_value}")
-                            else:
-                                logger.debug(f"🔍 order не является словарем: {type(order_info)}")
+                    simple_events.append(event_record)
                 
-                return valid_events
+                logger.info(f"✅ Обработано {len(simple_events)} событий для sync_orders_safe")
+                return simple_events
                 
         except httpx.HTTPStatusError as e:
             logger.error(f"❌ HTTP ошибка при получении событий: {e.response.status_code}")
@@ -768,42 +777,11 @@ class OrderSyncService:
             logger.error(f"❌ Неожиданная ошибка при получении событий: {e}")
             return []
             
-    def _fetch_order_details_safe(self, order_id: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
-        """
-        Безопасное получение деталей заказа.
-        
-        Args:
-            order_id: ID заказа
-            headers: HTTP заголовки с авторизацией
-            
-        Returns:
-            Optional[Dict]: Данные заказа или None при ошибке
-        """
-        
-        try:
-            url = f"https://api.allegro.pl/order/checkout-forms/{order_id}"
-            
-            with httpx.Client() as client:
-                response = client.get(url, headers=headers, timeout=15.0)
-                
-                if response.status_code == 404:
-                    logger.warning(f"⚠️ Заказ {order_id} не найден (возможно, объединен)")
-                    return None
-                    
-                response.raise_for_status()
-                return response.json()
-                
-        except httpx.HTTPStatusError as e:
-            logger.error(f"❌ Ошибка при получении деталей заказа {order_id}: {e.response.status_code}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"❌ Неожиданная ошибка при получении заказа {order_id}: {e}")
-            return None
-            
     def _process_single_order_safe(self, data_item: Dict[str, Any]) -> Dict[str, Any]:
         """
         Безопасная обработка заказа с полной защитой данных.
+        
+        ВАЖНО: Этот метод ТОЛЬКО обрабатывает заказ. События уже сохраняются в родительском методе!
         
         Работает с данными как из Events API (с событиями), так и из Checkout Forms API (без событий).
         
@@ -816,7 +794,7 @@ class OrderSyncService:
         
         # 🔍 Определяем источник данных и извлекаем информацию
         try:
-            source = data_item.get("source", "events_api")
+            source = data_item.get("source", "Unknown")
             order_data = data_item.get("order", {})
             order_id = data_item.get("order_id")
             
@@ -864,31 +842,26 @@ class OrderSyncService:
             occurred_at = datetime.utcnow()
             order_date = datetime.utcnow()
         
-        # 🔄 Извлекаем revision из данных заказа
-        revision = order_data.get("revision")
+        # 🔄 Извлекаем revision из данных заказа в зависимости от источника
+        revision = None
+        
+        if source == "events_api":
+            # Для Events API revision находится в checkoutForm
+            checkout_form = order_data.get("checkoutForm", {})
+            revision = checkout_form.get("revision")
+        else:
+            # Для full_api_details и checkout_forms_api revision в корне заказа
+            revision = order_data.get("revision")
+        
+        # Fallback: используем временную метку как revision
         if not revision:
-            # Fallback: используем временную метку как revision
             revision = str(int(occurred_at.timestamp())) if occurred_at else str(int(datetime.utcnow().timestamp()))
         
         logger.info(f"🔄 Обработка заказа {order_id}, revision {revision}, source={source}")
         
-        # 📊 Сохраняем событие ТОЛЬКО для данных из Events API
-        if source == "events_api":
-            try:
-                event_data = data_item.get("event", {})
-                self._save_order_event(
-                    order_id=order_id,
-                    event_type=event_data.get("type", "UNKNOWN"),
-                    event_data=event_data,
-                    occurred_at=occurred_at
-                )
-                logger.info(f"📊 Событие сохранено для заказа {order_id}")
-            except Exception as e:
-                logger.error(f"❌ Ошибка сохранения события для заказа {order_id}: {e}")
-        else:
-            logger.info(f"📋 Заказ {order_id} из Checkout Forms API - событие НЕ создается")
-        
         # 🛡️ Используем защищенное обновление заказа
+        # ПРИМЕЧАНИЕ: OrderProtectionService повторно проверит revision (optimistic locking)
+        # Это нормально - двойная проверка добавляет безопасность против race conditions
         result = self.protection_service.safe_order_update(
             order_id=order_id,
             new_data=order_data,
@@ -1003,6 +976,177 @@ class OrderSyncService:
             logger.error(f"❌ Ошибка при восстановлении заказа {order_id}: {e}")
             return False 
 
+    def _check_order_needs_update(self, order_id: str, new_revision: str) -> Dict[str, Any]:
+        """
+        Проверяет существует ли заказ в БД и нужно ли его обновлять по revision.
+        
+        Args:
+            order_id: ID заказа в системе Allegro
+            new_revision: Новая revision из события
+            
+        Returns:
+            Dict с информацией о необходимости создания/обновления:
+            {
+                "exists": bool,
+                "needs_update": bool,
+                "current_revision": str,
+                "action": "create" | "update" | "skip"
+            }
+        """
+        try:
+            from sqlmodel import select
+            from app.models.order import Order
+            from uuid import UUID
+            
+            # Ищем заказ в БД по order_id и token_id
+            query = select(Order).where(
+                Order.allegro_order_id == order_id,
+                Order.token_id == UUID(self.token_id),
+                Order.is_deleted == False
+            )
+            
+            existing_order = self.db.exec(query).first()
+            
+            if not existing_order:
+                logger.info(f"📝 Заказ {order_id} не найден в БД, требуется создание")
+                return {
+                    "exists": False,
+                    "needs_update": False,
+                    "current_revision": None,
+                    "action": "create"
+                }
+            
+            # Извлекаем текущую revision из данных заказа
+            order_data = existing_order.order_data or {}
+            current_revision = order_data.get("revision")
+            
+            if current_revision != new_revision:
+                logger.info(f"🔄 Заказ {order_id} требует обновления: {current_revision} → {new_revision}")
+                return {
+                    "exists": True,
+                    "needs_update": True,
+                    "current_revision": current_revision,
+                    "action": "update"
+                }
+            else:
+                logger.info(f"✅ Заказ {order_id} актуален (revision: {current_revision}), обновление не требуется")
+                return {
+                    "exists": True,
+                    "needs_update": False,
+                    "current_revision": current_revision,
+                    "action": "skip"
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки заказа {order_id}: {e}")
+            # В случае ошибки лучше попытаться обновить
+            return {
+                "exists": False,
+                "needs_update": True,
+                "current_revision": None,
+                "action": "create"
+            }
+
+    def _get_order_details_from_api(self, order_id: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
+        """
+        Получает полные детали заказа через Allegro API с retry механизмом.
+        
+        Args:
+            order_id: ID заказа в системе Allegro
+            max_retries: Максимальное количество попыток
+            
+        Returns:
+            Dict с деталями заказа или None при ошибке
+        """
+        import time
+        from sqlmodel import select
+        from app.models.user_token import UserToken
+        from uuid import UUID
+        
+        # Получаем токен доступа
+        try:
+            token_uuid = UUID(self.token_id)
+            query = select(UserToken).where(
+                UserToken.id == token_uuid,
+                UserToken.user_id == self.user_id,
+                UserToken.is_active == True,
+                UserToken.expires_at > datetime.utcnow()
+            )
+            
+            token_record = self.db.exec(query).first()
+            if not token_record:
+                logger.error(f"❌ Токен {self.token_id} недействителен для получения деталей заказа {order_id}")
+                return None
+                
+            token = token_record.allegro_token
+            
+        except ValueError:
+            logger.error(f"❌ Некорректный UUID токена: {self.token_id}")
+            return None
+            
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.allegro.public.v1+json"
+        }
+        
+        url = f"https://api.allegro.pl/order/checkout-forms/{order_id}"
+        
+        # Retry логика с экспоненциальным backoff
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"🔍 Получение деталей заказа {order_id} через API (попытка {attempt + 1}/{max_retries})")
+                
+                with httpx.Client() as client:
+                    response = client.get(url, headers=headers, timeout=15.0)
+                    
+                    if response.status_code == 404:
+                        logger.warning(f"⚠️ Заказ {order_id} не найден в API")
+                        return None
+                        
+                    response.raise_for_status()
+                    order_data = response.json()
+                    
+                    logger.info(f"✅ Получены детали заказа {order_id} (попытка {attempt + 1})")
+                    return order_data
+                    
+            except (httpx.ConnectError, httpx.TimeoutException, ConnectionError) as e:
+                # Временные сетевые ошибки - делаем retry
+                error_msg = f"Сетевая ошибка при получении деталей заказа {order_id}: {e}"
+                
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 1, 2, 4 секунды
+                    wait_time = 2 ** attempt
+                    logger.warning(f"⚠️ {error_msg}. Повторная попытка через {wait_time}с...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"❌ {error_msg}. Все попытки исчерпаны.")
+                    return None
+                    
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in [429, 500, 502, 503, 504]:
+                    # Временные ошибки сервера - делаем retry
+                    error_msg = f"Временная ошибка API при получении деталей заказа {order_id}: {e.response.status_code}"
+                    
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        logger.warning(f"⚠️ {error_msg}. Повторная попытка через {wait_time}с...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"❌ {error_msg}. Все попытки исчерпаны.")
+                        return None
+                else:
+                    # Постоянные ошибки (401, 403, 404) - не ретраим
+                    logger.error(f"❌ HTTP ошибка при получении деталей заказа {order_id}: {e.response.status_code}")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"❌ Неожиданная ошибка при получении деталей заказа {order_id}: {e}")
+                return None
+                
+        return None
+
     def _save_all_events_to_db(self, event_data: Dict[str, Any]):
         """
         Сохраняет все события в базу данных для полноты audit trail.
@@ -1046,6 +1190,190 @@ class OrderSyncService:
             logger.error(f"❌ Ошибка сохранения события в базу: {e}")
             self.db.rollback()
             # Не прерываем процесс из-за ошибки сохранения события
+    
+    def _save_failed_order(self, order_id: str, action_required: str, error_message: str, 
+                          error_type: str = "api_error", event_data: Optional[Dict[str, Any]] = None,
+                          expected_revision: Optional[str] = None) -> bool:
+        """
+        Сохраняет проблемный заказ для последующей переобработки.
+        
+        Args:
+            order_id: ID заказа 
+            action_required: Требуемое действие (create, update, skip)
+            error_message: Сообщение об ошибке
+            error_type: Тип ошибки
+            event_data: Данные события
+            expected_revision: Ожидаемая revision
+            
+        Returns:
+            bool: True если успешно сохранен
+        """
+        try:
+            from uuid import UUID
+            
+            # Проверяем, нет ли уже такого проблемного заказа в статусе PENDING/RETRYING
+            from sqlmodel import select
+            existing_query = select(FailedOrderProcessing).where(
+                FailedOrderProcessing.order_id == order_id,
+                FailedOrderProcessing.token_id == UUID(self.token_id),
+                FailedOrderProcessing.status.in_([FailedOrderStatus.PENDING, FailedOrderStatus.RETRYING])
+            )
+            
+            existing_failed = self.db.exec(existing_query).first()
+            
+            if existing_failed:
+                # Обновляем существующую запись
+                existing_failed.mark_for_retry(error_message, error_type)
+                if event_data:
+                    existing_failed.event_data = event_data
+                if expected_revision:
+                    existing_failed.expected_revision = expected_revision
+                    
+                logger.info(f"🔄 Обновлена запись проблемного заказа {order_id} (попытка {existing_failed.retry_count})")
+            else:
+                # Создаем новую запись
+                failed_order = FailedOrderProcessing(
+                    order_id=order_id,
+                    token_id=UUID(self.token_id),
+                    action_required=action_required,
+                    error_type=error_type,
+                    error_message=error_message,
+                    event_data=event_data,
+                    expected_revision=expected_revision,
+                    next_retry_at=datetime.utcnow() + timedelta(minutes=1)  # Первая попытка через 1 минуту
+                )
+                
+                self.db.add(failed_order)
+                logger.info(f"💾 Сохранен проблемный заказ {order_id} для переобработки")
+            
+            self.db.commit()
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения проблемного заказа {order_id}: {e}")
+            self.db.rollback()
+            return False
+    
+    def process_failed_orders(self, limit: int = 50) -> Dict[str, Any]:
+        """
+        Переобрабатывает проблемные заказы, которые готовы к повторной попытке.
+        
+        Args:
+            limit: Максимальное количество заказов для обработки за раз
+            
+        Returns:
+            Dict: Статистика переобработки
+        """
+        if not self.token_id:
+            raise ValueError("token_id обязателен для переобработки проблемных заказов")
+            
+        result = {
+            "processed": 0,
+            "resolved": 0,
+            "failed": 0,
+            "abandoned": 0,
+            "started_at": datetime.utcnow()
+        }
+        
+        try:
+            from sqlmodel import select
+            from uuid import UUID
+            
+            # Получаем проблемные заказы готовые к повторной обработке
+            query = select(FailedOrderProcessing).where(
+                FailedOrderProcessing.token_id == UUID(self.token_id),
+                FailedOrderProcessing.status == FailedOrderStatus.PENDING,
+                FailedOrderProcessing.next_retry_at <= datetime.utcnow()
+            ).limit(limit)
+            
+            failed_orders = self.db.exec(query).all()
+            
+            if not failed_orders:
+                logger.info("✅ Проблемных заказов для переобработки не найдено")
+                return result
+                
+            logger.info(f"🔄 Найдено {len(failed_orders)} проблемных заказов для переобработки")
+            
+            for failed_order in failed_orders:
+                try:
+                    result["processed"] += 1
+                    
+                    # Отмечаем как в процессе обработки
+                    failed_order.status = FailedOrderStatus.RETRYING
+                    failed_order.last_retry_at = datetime.utcnow()
+                    self.db.commit()
+                    
+                    logger.info(f"🔄 Переобработка заказа {failed_order.order_id} (попытка {failed_order.retry_count + 1})")
+                    
+                    # Пытаемся получить детали заказа
+                    order_details = self._get_order_details_from_api(failed_order.order_id)
+                    
+                    if order_details:
+                        # Создаем структуру данных для обработки
+                        order_data_item = {
+                            "order": order_details,
+                            "order_id": failed_order.order_id,
+                            "source": "full_api_details"
+                        }
+                        
+                        # Обрабатываем заказ
+                        process_result = self._process_single_order_safe(order_data_item)
+                        
+                        if process_result["success"]:
+                            # Успех - помечаем как разрешенный
+                            failed_order.mark_resolved()
+                            result["resolved"] += 1
+                            logger.info(f"✅ Проблемный заказ {failed_order.order_id} успешно обработан: {process_result['action']}")
+                        else:
+                            # Ошибка обработки
+                            error_msg = f"Ошибка обработки заказа: {process_result.get('message', 'Unknown error')}"
+                            failed_order.mark_for_retry(error_msg, "processing_error")
+                            result["failed"] += 1
+                            
+                            if failed_order.status == FailedOrderStatus.ABANDONED:
+                                result["abandoned"] += 1
+                            
+                    else:
+                        # Не удалось получить детали - отмечаем для retry
+                        failed_order.mark_for_retry("Не удалось получить детали заказа", "api_fetch_failed")
+                        result["failed"] += 1
+                        
+                        if failed_order.status == FailedOrderStatus.ABANDONED:
+                            result["abandoned"] += 1
+                            
+                    self.db.commit()
+                    
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при переобработке заказа {failed_order.order_id}: {e}")
+                    
+                    # Откатываем изменения для этого заказа
+                    self.db.rollback()
+                    
+                    # Пытаемся отметить заказ как проблемный
+                    try:
+                        failed_order.mark_for_retry(f"Неожиданная ошибка: {str(e)}", "unexpected_error")
+                        if failed_order.status == FailedOrderStatus.ABANDONED:
+                            result["abandoned"] += 1
+                        self.db.commit()
+                    except:
+                        pass
+                        
+                    result["failed"] += 1
+                    
+            result["completed_at"] = datetime.utcnow()
+            
+            logger.info(
+                f"✅ Переобработка завершена: обработано {result['processed']}, "
+                f"разрешено {result['resolved']}, ошибок {result['failed']}, "
+                f"отброшено {result['abandoned']}"
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка переобработки проблемных заказов: {e}")
+            result["error"] = str(e)
+            return result
             
     def _save_order_event(self, order_id: str, event_type: str, 
                          event_data: Dict[str, Any], occurred_at: Optional[datetime] = None):

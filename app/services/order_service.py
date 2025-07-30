@@ -337,13 +337,13 @@ class OrderService:
                 query = query.where(Order.order_data['status'].as_string() == status_filter)
                 
             if from_date:
-                query = query.where(Order.created_at >= from_date)
+                query = query.where(Order.order_date >= from_date)
                 
             if to_date:
-                query = query.where(Order.created_at <= to_date)
+                query = query.where(Order.order_date <= to_date)
                 
-            # Добавляем сортировку и пагинацию
-            query = query.order_by(Order.created_at.desc()).offset(offset).limit(limit)
+            # Добавляем сортировку и пагинацию (по дате заказа, самые свежие первыми)
+            query = query.order_by(Order.order_date.desc()).offset(offset).limit(limit)
             
             # Выполняем запрос
             orders = self.db.exec(query).all()
@@ -374,9 +374,9 @@ class OrderService:
             if status_filter:
                 count_query = count_query.where(Order.order_data['status'].as_string() == status_filter)
             if from_date:
-                count_query = count_query.where(Order.created_at >= from_date)
+                count_query = count_query.where(Order.order_date >= from_date)
             if to_date:
-                count_query = count_query.where(Order.created_at <= to_date)
+                count_query = count_query.where(Order.order_date <= to_date)
                 
             total_count = self.db.exec(count_query).one()
             
@@ -503,8 +503,8 @@ class OrderService:
                     Order.token_id == self.token_id
                 )
             
-            # Добавляем сортировку
-            query = query.order_by(Order.created_at.desc())
+            # Добавляем сортировку (по дате заказа, самые свежие первыми)
+            query = query.order_by(Order.order_date.desc())
             
             # Для поиска применяем лимит сразу, без пагинации
             orders = self.db.exec(query.limit(limit)).all()

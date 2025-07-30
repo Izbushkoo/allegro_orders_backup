@@ -9,7 +9,9 @@ from typing import Optional
 from uuid import UUID
 from enum import Enum
 
-from sqlmodel import SQLModel, Field, Relationship
+from sqlmodel import SQLModel, Field, Relationship, Column
+from sqlalchemy import ForeignKey
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 from .base import BaseModel
 
@@ -26,7 +28,7 @@ class SyncHistoryBase(SQLModel):
     """Базовые поля истории синхронизации"""
     
     token_id: UUID = Field(
-        foreign_key="user_tokens.id",
+        sa_column=Column(PG_UUID, ForeignKey("user_tokens.id", ondelete="CASCADE")),
         description="ID токена пользователя"
     )
     

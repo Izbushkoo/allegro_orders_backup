@@ -8,7 +8,9 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from sqlmodel import SQLModel, Field, UniqueConstraint
+from sqlmodel import SQLModel, Field, UniqueConstraint, Column
+from sqlalchemy import ForeignKey
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from pydantic import BaseModel
 
 from .base import BaseModel as BaseDBModel
@@ -18,7 +20,7 @@ class OrderTechnicalFlagsBase(SQLModel):
     """Базовые поля технических флагов заказа"""
     
     token_id: UUID = Field(
-        foreign_key="user_tokens.id",
+        sa_column=Column(PG_UUID, ForeignKey("user_tokens.id", ondelete="CASCADE")),
         description="ID токена пользователя"
     )
     

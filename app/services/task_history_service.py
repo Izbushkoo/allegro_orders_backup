@@ -4,6 +4,7 @@
 @dependencies: TaskHistory, sqlmodel
 """
 import json
+import logging
 from datetime import datetime
 from typing import Optional, Dict, Any
 from uuid import UUID
@@ -11,30 +12,79 @@ from uuid import UUID
 from sqlmodel import Session, select
 from app.models.task_history import TaskHistory
 
+logger = logging.getLogger(__name__)
+
 class TaskHistoryService:
     def __init__(self, db: Session):
         self.db = db
 
-    def create_task(self, *, task_id: str, user_id: str, task_type: str, params: Dict[str, Any], description: Optional[str] = None, parent_task_id: Optional[str] = None) -> TaskHistory:
+    def create_task(self, task_id: str, user_id: str, task_type: str, params: dict, description: str = None, parent_task_id: str = None):
+        """
+        Создает новую задачу в истории или обновляет существующую.
+        
+        Использует логику upsert для предотвращения ошибок duplicate key.
+        """
         now = datetime.utcnow()
-        task = TaskHistory(
-            task_id=task_id,
-            user_id=user_id,
-            task_type=task_type,
-            status="PENDING",
-            params=params,
-            result=None,
-            error=None,
-            started_at=now,
-            updated_at=now,
-            description=description,
-            progress=None,
-            parent_task_id=parent_task_id
-        )
-        self.db.add(task)
-        self.db.commit()
-        self.db.refresh(task)
-        return task
+        
+        try:
+            # Проверяем, существует ли уже задача с таким task_id
+            existing_task = self.db.exec(select(TaskHistory).where(TaskHistory.task_id == task_id)).first()
+            
+            if existing_task:
+                # Обновляем существующую задачу
+                existing_task.status = "PENDING"
+                existing_task.params = params
+                existing_task.error = None
+                existing_task.started_at = now
+                existing_task.updated_at = now
+                existing_task.finished_at = None
+                if description:
+                    existing_task.description = description
+                if parent_task_id:
+                    existing_task.parent_task_id = parent_task_id
+                    
+                self.db.commit()
+                self.db.refresh(existing_task)
+                
+                logger.info(f"📝 Обновлена существующая задача {task_id} типа {task_type}")
+                return existing_task
+            else:
+                # Создаем новую задачу
+                task = TaskHistory(
+                    task_id=task_id,
+                    user_id=user_id,
+                    task_type=task_type,
+                    status="PENDING",
+                    params=params,
+                    result=None,
+                    error=None,
+                    started_at=now,
+                    updated_at=now,
+                    description=description,
+                    progress=None,
+                    parent_task_id=parent_task_id
+                )
+                self.db.add(task)
+                self.db.commit()
+                self.db.refresh(task)
+                
+                logger.info(f"📝 Создана новая задача {task_id} типа {task_type}")
+                return task
+                
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"❌ Ошибка при создании/обновлении задачи {task_id}: {e}")
+            
+            # Попытка повторного получения задачи (возможно, она была создана в параллельном процессе)
+            try:
+                existing_task = self.db.exec(select(TaskHistory).where(TaskHistory.task_id == task_id)).first()
+                if existing_task:
+                    logger.info(f"📝 Найдена существующая задача {task_id} после ошибки")
+                    return existing_task
+            except Exception as e2:
+                logger.error(f"❌ Повторная ошибка при поиске задачи {task_id}: {e2}")
+            
+            raise e
 
     def update_task(self, task_id: str, **kwargs):
         task = self.db.exec(select(TaskHistory).where(TaskHistory.task_id == task_id)).first()
