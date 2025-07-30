@@ -209,3 +209,4 @@ __marimo__/
 
 postgres_data
 docker-compose.yml
+app/logs/*
