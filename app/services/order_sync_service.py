@@ -229,12 +229,12 @@ class OrderSyncService:
                             logger.debug(f"📝 Событие {event_type} сохранено, но заказ не обработан")
                         
                 except DataIntegrityError as e:
-                    logger.error(f"❌ Ошибка целостности данных для события {event_data.get('event', {}).get('id', 'unknown')}: {e}")
+                    logger.error(f"❌ Ошибка целостности данных для события {data_item.get('event', {}).get('id', 'unknown')}: {e}")
                     sync_result["orders_failed"] += 1
                     sync_result["critical_issues"].append(str(e))
                     
                 except Exception as e:
-                    logger.error(f"❌ Неожиданная ошибка при обработке события {event_data.get('event', {}).get('id', 'unknown')}: {e}")
+                    logger.error(f"❌ Неожиданная ошибка при обработке события {data_item.get('event', {}).get('id', 'unknown')}: {e}")
                     sync_result["orders_failed"] += 1
             
             # 📝 4. Создание записи о начале синхронизации

@@ -1,6 +1,6 @@
 """
 @file: app/core/logging.py
-@description: Настройка системы логирования с JSON форматом и ротацией
+@description: Настройка системы логирования с удобочитаемым форматом и ротацией
 @dependencies: logging, json
 """
 
@@ -13,6 +13,74 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .settings import settings
+
+
+class SQLAlchemyFilter(logging.Filter):
+    """Фильтр для блокирования всех SQLAlchemy логов"""
+    
+    def filter(self, record):
+        # Блокируем все логи от SQLAlchemy
+        if record.name.startswith('sqlalchemy'):
+            return False
+        return True
+
+
+class HumanReadableFormatter(logging.Formatter):
+    """Форматировщик для удобочитаемых логов"""
+    
+    def format(self, record: logging.LogRecord) -> str:
+        """Форматирует запись в удобочитаемом формате"""
+        # Базовое время и уровень
+        timestamp = datetime.fromtimestamp(record.created).strftime('%Y-%m-%d %H:%M:%S')
+        level_emoji = self._get_level_emoji(record.levelno)
+        level_name = record.levelname.ljust(8)
+        
+        # Основное сообщение
+        message = record.getMessage()
+        
+        # Дополнительная информация
+        extra_info = []
+        
+        # Добавляем user_id если есть
+        if hasattr(record, "user_id"):
+            extra_info.append(f"user={record.user_id}")
+            
+        # Добавляем task_id если есть
+        if hasattr(record, "task_id"):
+            extra_info.append(f"task={record.task_id}")
+            
+        # Добавляем request_id если есть
+        if hasattr(record, "request_id"):
+            extra_info.append(f"req={record.request_id}")
+            
+        # Добавляем module если это не основной логгер
+        if record.name != "root" and record.name != "__main__":
+            extra_info.append(f"module={record.name}")
+            
+        # Формируем строку
+        result = f"{timestamp} {level_emoji} {level_name} {message}"
+        
+        if extra_info:
+            result += f" | {' | '.join(extra_info)}"
+            
+        # Добавляем исключение если есть
+        if record.exc_info:
+            result += f"\n{self.formatException(record.exc_info)}"
+            
+        return result
+    
+    def _get_level_emoji(self, levelno: int) -> str:
+        """Возвращает эмодзи для уровня логирования"""
+        if levelno >= logging.CRITICAL:
+            return "🚨"
+        elif levelno >= logging.ERROR:
+            return "❌"
+        elif levelno >= logging.WARNING:
+            return "⚠️"
+        elif levelno >= logging.INFO:
+            return "ℹ️"
+        else:
+            return "🔍"
 
 
 class JSONFormatter(logging.Formatter):
@@ -52,6 +120,14 @@ class JSONFormatter(logging.Formatter):
 def setup_logging() -> None:
     """Настройка системы логирования"""
     
+    # Сначала отключаем все SQLAlchemy логи
+    logging.getLogger("sqlalchemy").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.pool").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.dialects").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.orm").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.engine.base.Engine").setLevel(logging.CRITICAL)
+    
     # Создаем директорию для логов
     log_path = Path(settings.logging.file_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -67,13 +143,14 @@ def setup_logging() -> None:
     logger = logging.getLogger()
     logger.handlers.clear()
     
-    # Форматировщик
+    # Создаем фильтр для блокирования SQLAlchemy
+    sqlalchemy_filter = SQLAlchemyFilter()
+    
+    # Выбираем форматировщик
     if settings.logging.format.lower() == "json":
         formatter = JSONFormatter()
     else:
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
+        formatter = HumanReadableFormatter()
     
     # Handler для файла с ротацией
     file_handler = logging.handlers.RotatingFileHandler(
@@ -83,20 +160,50 @@ def setup_logging() -> None:
         encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(sqlalchemy_filter)  # Добавляем фильтр
     logger.addHandler(file_handler)
     
     # Handler для консоли (только в режиме разработки)
     if settings.api.debug:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(formatter)
+        console_handler.addFilter(sqlalchemy_filter)  # Добавляем фильтр
         logger.addHandler(console_handler)
     
     # Настройка уровней для внешних библиотек
+    # SQLAlchemy - полностью отключаем логи
+    logging.getLogger("sqlalchemy").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.pool").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.dialects").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.orm").setLevel(logging.CRITICAL)
+    logging.getLogger("sqlalchemy.engine.base.Engine").setLevel(logging.CRITICAL)
+    
+    # Celery - только важные сообщения
+    logging.getLogger("celery").setLevel(logging.WARNING)
+    logging.getLogger("celery.worker").setLevel(logging.INFO)
+    logging.getLogger("celery.task").setLevel(logging.INFO)
+    logging.getLogger("celery.worker.strategy").setLevel(logging.WARNING)
+    
+    # FastAPI и Uvicorn
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
-    logging.getLogger("fastapi").setLevel(logging.INFO)
-    logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
-    logging.getLogger("celery").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("fastapi").setLevel(logging.WARNING)
+    
+    # HTTP клиенты
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    
+    # Redis
+    logging.getLogger("redis").setLevel(logging.WARNING)
+    
+    # Alembic
+    logging.getLogger("alembic").setLevel(logging.WARNING)
+    
+    # Другие библиотеки
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
     
     logger.info("Logging system initialized", extra={
         "extra_data": {

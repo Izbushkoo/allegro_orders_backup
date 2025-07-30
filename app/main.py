@@ -15,6 +15,8 @@ from app.core.database import db_manager
 from app.core.auth import CurrentUser
 from app.api.dependencies import CurrentUserDep
 
+# Инициализация логирования в самом начале
+setup_logging()
 
 logger = get_logger(__name__)
 
@@ -25,8 +27,7 @@ async def lifespan(app: FastAPI):
     # Запуск
     logger.info("Starting Allegro Orders Backup service...")
     
-    # Инициализация логирования
-    setup_logging()
+
     
     # Логирование настроек приложения
     logger.info("Logging application configuration...")

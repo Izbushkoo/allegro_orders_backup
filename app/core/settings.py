@@ -161,7 +161,7 @@ class LoggingSettings(BaseSettings):
     file_path: str = Field(default="./logs/app.log", alias="LOG_FILE_PATH")
     max_bytes: int = Field(default=5242880, alias="LOG_MAX_BYTES")  # 5MB
     backup_count: int = Field(default=3, alias="LOG_BACKUP_COUNT")
-    format: str = Field(default="json", alias="LOG_FORMAT")
+    format: str = Field(default="human", alias="LOG_FORMAT")
 
     class Config:
         env_file = ".env"

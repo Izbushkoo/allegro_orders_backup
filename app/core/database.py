@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 # Синхронный движок для Alembic миграций
 sync_engine = create_engine(
     settings.database.url,
-    echo=settings.api.debug,
+    echo=False,  # Отключаем SQL логирование
     pool_pre_ping=True,
     pool_recycle=300,
 )
@@ -30,7 +30,7 @@ sync_engine = create_engine(
 async_database_url = settings.database.url.replace("postgresql://", "postgresql+asyncpg://")
 async_engine = create_async_engine(
     async_database_url,
-    echo=settings.api.debug,
+    echo=False,  # Отключаем SQL логирование
     pool_pre_ping=True,
     pool_recycle=300,
 )

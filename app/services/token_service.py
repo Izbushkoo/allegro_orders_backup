@@ -40,7 +40,8 @@ class TokenService:
             query = select(UserToken).where(
                 and_(
                     UserToken.user_id == user_id,
-                    UserToken.account_name == account_name
+                    UserToken.account_name == account_name,
+                    UserToken.is_active == True
                 )
             )
             result = await self.db_session.exec(query)

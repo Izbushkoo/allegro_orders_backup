@@ -1,24 +1,27 @@
 """
 @file: app/tasks/token_tasks.py
-@description: Celery задачи для управления токенами Allegro, включая массовое обновление с историей
-@dependencies: celery, TaskHistoryService, TokenService, sqlmodel
+@description: Celery задачи для управления токенами Allegro
+@dependencies: celery, app.services.token_service, app.services.allegro_auth_service
 """
 
-import asyncio
+import logging
+from uuid import UUID
 from datetime import datetime, timedelta
+from typing import Dict, Any, Optional
 
-from celery.exceptions import Retry
+from celery import current_task
+from sqlmodel import Session, select
+
+
 from app.celery_app import celery_app
-from app.core.logging import get_logger
-from app.core.database import get_sync_session
-from app.services.allegro_auth_service import AllegroAuthService
 from app.core.database import get_sync_db_session_direct
+from app.core.logging import get_logger
 from app.models.user_token import UserToken
 from app.services.token_service import TokenService
-from sqlmodel import Session
+from app.services.allegro_auth_service import AllegroAuthService
 from app.services.task_history_service import TaskHistoryService
-from uuid import UUID
 
+# Получаем логгер для этого модуля
 logger = get_logger(__name__)
 
 
@@ -168,7 +171,7 @@ def refresh_all_tokens(self):
     # Создаем запись в TaskHistory
     task_history = task_history_service.create_task(
         task_id=task_id,
-        user_id=UUID("00000000-0000-0000-0000-000000000000"),
+        user_id="00000000-0000-0000-0000-000000000000",
         task_type="refresh_all_tokens_with_history",
         params=params,
         description=description

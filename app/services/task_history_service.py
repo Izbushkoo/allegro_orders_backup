@@ -7,6 +7,7 @@ import json
 from datetime import datetime
 from typing import Optional, Dict, Any
 from uuid import UUID
+
 from sqlmodel import Session, select
 from app.models.task_history import TaskHistory
 
@@ -14,7 +15,7 @@ class TaskHistoryService:
     def __init__(self, db: Session):
         self.db = db
 
-    def create_task(self, *, task_id: str, user_id: UUID, task_type: str, params: Dict[str, Any], description: Optional[str] = None, parent_task_id: Optional[str] = None) -> TaskHistory:
+    def create_task(self, *, task_id: str, user_id: str, task_type: str, params: Dict[str, Any], description: Optional[str] = None, parent_task_id: Optional[str] = None) -> TaskHistory:
         now = datetime.utcnow()
         task = TaskHistory(
             task_id=task_id,
@@ -43,10 +44,12 @@ class TaskHistoryService:
             if not hasattr(task, key):
                 continue  # пропускаем несуществующие поля
             if key == "result" and value is not None:
-                # Сериализуем datetime в строку
+                # Сериализуем datetime и UUID в строки
                 def default_serializer(obj):
                     if isinstance(obj, datetime):
                         return obj.isoformat()
+                    elif isinstance(obj, UUID):
+                        return str(obj)
                     raise TypeError(f"Type {type(obj)} not serializable")
                 value = json.loads(json.dumps(value, default=default_serializer))
             setattr(task, key, value)
@@ -58,7 +61,7 @@ class TaskHistoryService:
         """Получить задачу по task_id"""
         return self.db.exec(select(TaskHistory).where(TaskHistory.task_id == task_id)).first()
 
-    def get_tasks_by_user(self, user_id: UUID, limit: int = 50) -> list[TaskHistory]:
+    def get_tasks_by_user(self, user_id: str, limit: int = 50) -> list[TaskHistory]:
         """Получить список задач пользователя (по user_id)"""
         return self.db.exec(
             select(TaskHistory).where(TaskHistory.user_id == user_id).order_by(TaskHistory.started_at.desc()).limit(limit)
@@ -73,7 +76,7 @@ class TaskHistoryService:
             .limit(limit)
         ).all()
 
-    def revoke_task(self, task_id: str, user_id: UUID) -> Optional[TaskHistory]:
+    def revoke_task(self, task_id: str, user_id: str) -> Optional[TaskHistory]:
         """Отменить задачу (установить статус REVOKED), только если принадлежит user_id"""
         task = self.get_task_by_id(task_id)
         if not task or task.user_id != user_id:
@@ -86,7 +89,7 @@ class TaskHistoryService:
         self.db.refresh(task)
         return task
 
-    def get_task_result(self, task_id: str, user_id: UUID) -> Optional[dict]:
+    def get_task_result(self, task_id: str, user_id: str) -> Optional[dict]:
         """Получить подробный результат задачи, если принадлежит user_id"""
         task = self.get_task_by_id(task_id)
         if not task or task.user_id != user_id:

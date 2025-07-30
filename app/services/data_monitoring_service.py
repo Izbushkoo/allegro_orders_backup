@@ -478,7 +478,7 @@ class DataMonitoringService:
     
     def _validate_event_structure(self, event: Dict[str, Any]) -> bool:
         """Проверка базовой структуры события"""
-        required_fields = ['id', 'type', 'order']
+        required_fields = ['id', 'type', 'event']
         return all(field in event for field in required_fields)
     
     def _extract_order_id_safe(self, event: Dict[str, Any]) -> Optional[str]:
