@@ -15,6 +15,28 @@ from typing import Any, Dict
 from .settings import settings
 
 
+def disable_sqlalchemy_logging():
+    """Принудительно отключает все SQLAlchemy логи"""
+    sqlalchemy_loggers = [
+        "sqlalchemy",
+        "sqlalchemy.engine",
+        "sqlalchemy.engine.Engine", 
+        "sqlalchemy.engine.base.Engine",
+        "sqlalchemy.engine.base",
+        "sqlalchemy.pool",
+        "sqlalchemy.dialects",
+        "sqlalchemy.orm",
+    ]
+    
+    for logger_name in sqlalchemy_loggers:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.CRITICAL + 1)  # Выше CRITICAL
+        logger.disabled = True  # Полностью отключаем логгер
+        logger.propagate = False  # Не передаем в родительские логгеры
+        # Убираем все handlers
+        logger.handlers.clear()
+
+
 class SQLAlchemyFilter(logging.Filter):
     """Фильтр для блокирования всех SQLAlchemy логов"""
     
@@ -120,13 +142,8 @@ class JSONFormatter(logging.Formatter):
 def setup_logging() -> None:
     """Настройка системы логирования"""
     
-    # Сначала отключаем все SQLAlchemy логи
-    logging.getLogger("sqlalchemy").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.engine").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.pool").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.dialects").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.orm").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.engine.base.Engine").setLevel(logging.CRITICAL)
+    # Отключаем SQLAlchemy логи в самом начале
+    disable_sqlalchemy_logging()
     
     # Создаем директорию для логов
     log_path = Path(settings.logging.file_path)
@@ -171,13 +188,7 @@ def setup_logging() -> None:
         logger.addHandler(console_handler)
     
     # Настройка уровней для внешних библиотек
-    # SQLAlchemy - полностью отключаем логи
-    logging.getLogger("sqlalchemy").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.engine").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.pool").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.dialects").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.orm").setLevel(logging.CRITICAL)
-    logging.getLogger("sqlalchemy.engine.base.Engine").setLevel(logging.CRITICAL)
+    # SQLAlchemy уже отключен выше
     
     # Celery - только важные сообщения
     logging.getLogger("celery").setLevel(logging.WARNING)
@@ -204,6 +215,9 @@ def setup_logging() -> None:
     # Другие библиотеки
     logging.getLogger("asyncio").setLevel(logging.WARNING)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    
+    # Еще раз отключаем SQLAlchemy логи для гарантии
+    disable_sqlalchemy_logging()
     
     logger.info("Logging system initialized", extra={
         "extra_data": {
