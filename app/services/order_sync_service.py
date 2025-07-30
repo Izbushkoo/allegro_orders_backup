@@ -149,7 +149,7 @@ class OrderSyncService:
                     
                     if source == "checkout_forms_api":
                         # Данные получены напрямую через Checkout Forms API - НЕ создаем события
-                        logger.debug("📋 Обработка заказа из Checkout Forms API")
+                        logger.info("📋 Обработка заказа из Checkout Forms API")
                         
                         # Проверяем дедупликацию заказа
                         order_id = data_item.get("order_id")
@@ -177,7 +177,7 @@ class OrderSyncService:
                             
                     else:
                         # Данные получены через Events API - сохраняем события
-                        logger.debug("📡 Обработка события из Events API")
+                        logger.info("📡 Обработка события из Events API")
                         
                         # Извлекаем ID события для дедупликации
                         event_info = data_item.get("event", {})
@@ -226,7 +226,7 @@ class OrderSyncService:
                             elif result["action"] == "skipped":
                                 sync_result["orders_skipped"] += 1
                         else:
-                            logger.debug(f"📝 Событие {event_type} сохранено, но заказ не обработан")
+                            logger.info(f"📝 Событие {event_type} сохранено, но заказ не обработан")
                         
                 except DataIntegrityError as e:
                     logger.error(f"❌ Ошибка целостности данных для события {data_item.get('event', {}).get('id', 'unknown')}: {e}")
@@ -708,7 +708,7 @@ class OrderSyncService:
                                 "source": "events_api"  # Помечаем источник данных
                             }
                             valid_events.append(event_record)
-                            logger.debug(f"✅ Событие {event.get('type')} для заказа {order_id} с полными данными добавлено")
+                            logger.info(f"✅ Событие {event.get('type')} для заказа {order_id} с полными данными добавлено")
                         else:
                             # Если не удалось получить данные заказа, сохраняем только событие
                             event_record = {
@@ -728,7 +728,7 @@ class OrderSyncService:
                             "source": "events_api"
                         }
                         valid_events.append(event_record)
-                        logger.debug(f"✅ Событие {event.get('type')} без order_id добавлено")
+                        logger.info(f"✅ Событие {event.get('type')} без order_id добавлено")
                         
                         # Логируем структуру события для отладки
                         logger.debug(f"🔍 Структура события без order_id: {event}")
@@ -857,7 +857,7 @@ class OrderSyncService:
             if not occurred_at:
                 occurred_at = order_date
                 
-            logger.debug(f"📅 Заказ {order_id}: source={source}, occurred_at={occurred_at}, order_date={order_date}")
+            logger.info(f"📅 Заказ {order_id}: source={source}, occurred_at={occurred_at}, order_date={order_date}")
             
         except (ValueError, TypeError) as e:
             logger.error(f"❌ Ошибка парсинга дат для заказа {order_id}: {e}")
@@ -870,7 +870,7 @@ class OrderSyncService:
             # Fallback: используем временную метку как revision
             revision = str(int(occurred_at.timestamp())) if occurred_at else str(int(datetime.utcnow().timestamp()))
         
-        logger.debug(f"🔄 Обработка заказа {order_id}, revision {revision}, source={source}")
+        logger.info(f"🔄 Обработка заказа {order_id}, revision {revision}, source={source}")
         
         # 📊 Сохраняем событие ТОЛЬКО для данных из Events API
         if source == "events_api":
@@ -882,11 +882,11 @@ class OrderSyncService:
                     event_data=event_data,
                     occurred_at=occurred_at
                 )
-                logger.debug(f"📊 Событие сохранено для заказа {order_id}")
+                logger.info(f"📊 Событие сохранено для заказа {order_id}")
             except Exception as e:
                 logger.error(f"❌ Ошибка сохранения события для заказа {order_id}: {e}")
         else:
-            logger.debug(f"📋 Заказ {order_id} из Checkout Forms API - событие НЕ создается")
+            logger.info(f"📋 Заказ {order_id} из Checkout Forms API - событие НЕ создается")
         
         # 🛡️ Используем защищенное обновление заказа
         result = self.protection_service.safe_order_update(

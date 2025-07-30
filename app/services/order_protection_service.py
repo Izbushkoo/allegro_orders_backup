@@ -184,7 +184,7 @@ class OrderProtectionService:
                         logger.error(f"❌ Поле note.text имеет неверный тип: {type(data['note']['text'])} вместо str")
                         return False
                         
-        logger.debug(f"✅ Структура данных заказа валидна")
+        logger.info(f"✅ Структура данных заказа валидна")
         return True
         
     def safe_order_update(self, order_id: str, new_data: Dict[str, Any], 
@@ -218,9 +218,9 @@ class OrderProtectionService:
         }
         
         # 🔍 Детальное логирование для отладки
-        logger.debug(f"🔄 safe_order_update: order_id={order_id}, type={type(order_id)}")
-        logger.debug(f"🔄 safe_order_update: new_data keys={list(new_data.keys()) if new_data else 'None'}")
-        logger.debug(f"🔄 safe_order_update: allegro_revision={allegro_revision}")
+        logger.info(f"🔄 safe_order_update: order_id={order_id}, type={type(order_id)}")
+        logger.info(f"🔄 safe_order_update: new_data keys={list(new_data.keys()) if new_data else 'None'}")
+        logger.info(f"🔄 safe_order_update: allegro_revision={allegro_revision}")
         
         # Проверяем что order_id не None и не пустой
         if not order_id:
@@ -247,7 +247,7 @@ class OrderProtectionService:
                     result["action"] = "skipped"
                     result["message"] = f"Версия {allegro_revision} уже существует в базе"
                     result["success"] = True
-                    logger.debug(f"🔄 Заказ {order_id} пропущен: revision {allegro_revision} уже есть")
+                    logger.info(f"🔄 Заказ {order_id} пропущен: revision {allegro_revision} уже есть")
                     return result
                     
             # 4. Merge данных (если есть существующий заказ)
@@ -330,15 +330,15 @@ class OrderProtectionService:
         )
         
         self.db.add(order_event)
-        logger.debug(f"📝 Сохранено событие {event_type} для заказа {order_id}")
+        logger.info(f"📝 Сохранено событие {event_type} для заказа {order_id}")
         
     def _update_existing_order(self, order: Order, data: Dict[str, Any], 
-                              revision: Optional[str], order_date: Optional[datetime]):
+                              allegro_revision: Optional[str] = None) -> Dict[str, Any]:
         """Обновление существующего заказа"""
         
         # Добавляем revision в данные заказа
-        if revision:
-            data["revision"] = revision
+        if allegro_revision:
+            data["revision"] = allegro_revision
         
         # Обновляем данные заказа
         order.order_data = data

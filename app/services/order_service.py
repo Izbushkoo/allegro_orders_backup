@@ -177,7 +177,7 @@ class OrderService:
             
             url = f"{self.CHECKOUT_FORMS_URL}/{order_id}"
             
-            logger.debug(f"📋 Запрос деталей заказа: {order_id}")
+            logger.info(f"📋 Запрос деталей заказа: {order_id}")
             
             with httpx.Client() as client:
                 response = client.get(url, headers=headers, timeout=15.0)
@@ -212,7 +212,7 @@ class OrderService:
                     "order": order_data
                 })
                 
-                logger.debug(f"✅ Получены детали заказа {order_id}")
+                logger.info(f"✅ Получены детали заказа {order_id}")
                 
         except httpx.HTTPStatusError as e:
             error_msg = f"HTTP ошибка при получении заказа {order_id}: {e.response.status_code}"

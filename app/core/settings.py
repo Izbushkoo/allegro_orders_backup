@@ -157,7 +157,7 @@ class AllegroSettings(BaseSettings):
 class LoggingSettings(BaseSettings):
     """Настройки логирования"""
     
-    level: str = Field(default="INFO", alias="LOG_LEVEL")
+    level: str = Field(default="DEBUG", alias="LOG_LEVEL")
     file_path: str = Field(default="./logs/app.log", alias="LOG_FILE_PATH")
     max_bytes: int = Field(default=5242880, alias="LOG_MAX_BYTES")  # 5MB
     backup_count: int = Field(default=3, alias="LOG_BACKUP_COUNT")

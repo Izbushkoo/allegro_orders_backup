@@ -15,6 +15,9 @@ from app.models.user_token import UserToken
 from app.exceptions import NotFoundError, ValidationError
 from app.core.logging import get_logger
 from app.models.user_token import UserTokenUpdate
+from app.services.active_sync_schedule_service import ActiveSyncScheduleService
+from app.services.periodic_task_service import PeriodicTaskService
+from app.core.database import get_sync_db_session_direct, get_alchemy_session
 
 logger = get_logger(__name__)
 
@@ -291,7 +294,7 @@ class TokenService:
     
     async def deactivate_token(self, token_id: UUID) -> UserToken:
         """
-        Деактивировать токен (мягкое удаление).
+        Деактивировать токен (мягкое удаление) и удалить связанные периодические задачи.
         
         Args:
             token_id: ID токена
@@ -303,7 +306,15 @@ class TokenService:
             NotFoundError: Если токен не найден
         """
         try:
-            # Используем SQL UPDATE для деактивации
+            # Сначала получаем информацию о токене для поиска связанных задач
+            token_to_deactivate = await self.get_token(token_id)
+            if not token_to_deactivate:
+                raise NotFoundError(f"Token with id {token_id} not found")
+            
+            # Удаляем связанные периодические задачи синхронизации
+            await self._remove_periodic_sync_tasks(token_to_deactivate.user_id, str(token_id))
+            
+            # Используем SQL UPDATE для деактивации токена
             from sqlmodel import text
             
             sql = """
@@ -325,7 +336,7 @@ class TokenService:
             if not updated_token:
                 raise NotFoundError(f"Token with id {token_id} not found")
             
-            logger.info(f"Token {token_id} deactivated")
+            logger.info(f"Token {token_id} deactivated and periodic tasks removed")
             return updated_token
             
         except NotFoundError:
@@ -564,3 +575,56 @@ class TokenService:
         self.db_session.refresh(token)
         logger.info(f"[SYNC] Token {token_id} updated")
         return token 
+
+    async def _remove_periodic_sync_tasks(self, user_id: str, token_id: str):
+        """
+        Удалить все периодические задачи синхронизации для данного токена.
+        
+        Args:
+            user_id: ID пользователя
+            token_id: ID токена
+        """
+        try:
+            logger.info(f"Removing periodic sync tasks for token {token_id} of user {user_id}")
+            
+            # Получаем синхронную сессию для работы с ActiveSyncSchedule и PeriodicTask
+            sync_db = get_sync_db_session_direct()
+            alchemy_db = get_alchemy_session()
+            
+            try:
+                # Инициализируем сервисы
+                schedule_service = ActiveSyncScheduleService(sync_db)
+                periodic_service = PeriodicTaskService(alchemy_db)
+                
+                # Ищем активные расписания для данного токена
+                schedule = schedule_service.get_by_token(user_id, token_id)
+                
+                if schedule:
+                    logger.info(f"Found active sync schedule for token {token_id}: {schedule.task_name}")
+                    
+                    # Удаляем задачу из Celery Beat
+                    removed = periodic_service.remove_periodic_sync_task(schedule.task_name)
+                    if removed:
+                        logger.info(f"Removed periodic task from Celery Beat: {schedule.task_name}")
+                    else:
+                        logger.warning(f"Periodic task not found in Celery Beat: {schedule.task_name}")
+                    
+                    # Деактивируем запись в ActiveSyncSchedule
+                    deactivated = schedule_service.delete(user_id, token_id)
+                    if deactivated:
+                        logger.info(f"Deactivated sync schedule for token {token_id}")
+                    else:
+                        logger.warning(f"Failed to deactivate sync schedule for token {token_id}")
+                        
+                else:
+                    logger.info(f"No active sync schedule found for token {token_id}")
+                    
+            finally:
+                # Закрываем сессии
+                sync_db.close()
+                alchemy_db.close()
+                
+        except Exception as e:
+            logger.error(f"Error removing periodic sync tasks for token {token_id}: {str(e)}")
+            # Не прерываем процесс удаления токена из-за ошибки удаления периодических задач
+            # Логируем ошибку и продолжаем 
